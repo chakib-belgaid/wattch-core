@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package wattch.v0;
+
+// Wattch protocol v0.
+// Control-plane messages are allowed to be descriptive.
+// Data-plane messages must remain compact and avoid repeated strings.
+
+enum EvidenceClass {
+  EVIDENCE_CLASS_UNSPECIFIED = 0;
+  RAW_HARDWARE_COUNTER = 1;
+  RAW_SENSOR_READING = 2;
+  OS_TELEMETRY = 3;
+  TOOL_DERIVED_ESTIMATE = 4;
+  MODEL_DERIVED_ESTIMATE = 5;
+  BENCHMARK_MARKER = 6;
+}
+
+enum Temporality {
+  TEMPORALITY_UNSPECIFIED = 0;
+  CUMULATIVE = 1;
+  INSTANT = 2;
+  DELTA = 3;
+  GAUGE = 4;
+  EVENT = 5;
+}
+
+enum Unit {
+  UNIT_UNSPECIFIED = 0;
+  JOULE = 1;
+  WATT = 2;
+  MICROJOULE = 3;
+  NANOSECOND = 4;
+  PERCENT = 5;
+  COUNTER = 6;
+  HERTZ = 7;
+  CELSIUS = 8;
+  BYTE = 9;
+}
+
+enum SamplingMode {
+  SAMPLING_MODE_UNSPECIFIED = 0;
+  PERIODIC = 1;
+  EVENT_DRIVEN = 2;
+  POLLED = 3;
+  IMPORTED = 4;
+  SYNTHETIC = 5;
+}
+
+message SourceDescriptor {
+  // Local numeric id used by RawSample. Valid only inside this daemon/run.
+  uint32 local_source_id = 1;
+
+  // Stable logical identity of the source.
+  string source_uid = 2;
+
+  // Node identity. Local-only runs can use "local".
+  string node_id = 3;
+
+  // Backend name: deterministic, rapl, nvml, powermetrics, external, os, etc.
+  string backend = 4;
+
+  // Semantic kind: cpu_package_energy, gpu_power, c_state_residency, wakeups, etc.
+  string kind = 5;
+
+  Unit unit = 6;
+  Temporality temporality = 7;
+  EvidenceClass evidence_class = 8;
+
+  // Hierarchical path: cpu/package/0/energy, cpu/package/0/core/0/energy, gpu/0/power.
+  string source_path = 9;
+
+  // Parent source uid for nested topologies.
+  optional string parent_source_uid = 10;
+
+  string clock_domain = 11;
+  SamplingMode sampling_mode = 12;
+  optional uint64 nominal_period_ns = 13;
+  optional double max_value = 14;
+  optional double resolution = 15;
+
+  map<string, string> labels = 16;
+}
+
+message RawSample {
+  uint32 source_id = 1;
+  uint64 sequence_no = 2;
+  uint64 monotonic_ns = 3;
+
+  oneof value {
+    double f64 = 4;
+    sint64 i64 = 5;
+    bytes raw = 6;
+  }
+}
+
+message RawSampleBatch {
+  string run_id = 1;
+  string node_id = 2;
+  uint64 batch_sequence_no = 3;
+  repeated RawSample samples = 4;
+}
+
+message Event {
+  string event_id = 1;
+  string run_id = 2;
+  string node_id = 3;
+  uint64 monotonic_ns = 4;
+  string kind = 5;
+  map<string, string> labels = 6;
+}
+
+message EventBatch {
+  string run_id = 1;
+  string node_id = 2;
+  uint64 batch_sequence_no = 3;
+  repeated Event events = 4;
+}
+
+message HelloRequest {
+  string client_name = 1;
+  string client_version = 2;
+  repeated string accepted_protocol_versions = 3;
+}
+
+message HelloResponse {
+  string daemon_name = 1;
+  string daemon_version = 2;
+  string protocol_version = 3;
+  string node_id = 4;
+  repeated SourceDescriptor sources = 5;
+}
+
+message StartCapture {
+  string run_id = 1;
+  repeated uint32 source_ids = 2;
+  optional uint64 requested_period_ns = 3;
+  map<string, string> labels = 4;
+}
+
+message StopCapture {
+  string run_id = 1;
+  string reason = 2;
+}
+
+message Error {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message FramePayload {
+  oneof payload {
+    HelloRequest hello_request = 1;
+    HelloResponse hello_response = 2;
+    StartCapture start_capture = 3;
+    StopCapture stop_capture = 4;
+    RawSampleBatch raw_sample_batch = 10;
+    EventBatch event_batch = 11;
+    Error error = 255;
+  }
+}

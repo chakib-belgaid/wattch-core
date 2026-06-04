@@ -1,0 +1,30 @@
+[benchmark]
+name = "polling-vs-batching"
+workload = "synthetic-background-interference"
+
+[versions.batching]
+label = "batching"
+command = "./examples/workloads/batching-worker"
+
+[versions.polling]
+label = "polling"
+command = "./examples/workloads/polling-worker"
+
+[phases]
+warmup_s = 5
+measurement_s = 30
+cooldown_s = 20
+
+[repetitions]
+count = 10
+ordering = "paired-randomized"
+
+[signals]
+include_direct_energy = true
+include_gpu_power = true
+include_wakeups = true
+include_cstates = true
+include_idle_recovery = true
+
+[notes]
+status = "spec only; benchmark layer not implemented in the starting phase"
