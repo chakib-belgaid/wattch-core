@@ -15,4 +15,5 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wattch-core.workspace = true
+wattch-daemon.workspace = true
 wattch-protocol.workspace = true

@@ -459,6 +459,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wattch-core",
+ "wattch-daemon",
  "wattch-protocol",
 ]
 
