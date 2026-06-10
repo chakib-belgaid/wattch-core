@@ -1,0 +1,30 @@
+[Unit]
+Description=Wattch powermeter daemon (privileged RAPL acquisition)
+Documentation=https://github.com/chakib-belgaid/wattch-core
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wattch-powerd \
+  --socket /run/wattch/wattch-powerd.sock \
+  --backend linux-rapl \
+  --node-id %H
+RuntimeDirectory=wattch
+RuntimeDirectoryMode=0755
+# The daemon only needs read access to /sys/class/powercap. Running as a
+# dedicated user with the powercap files made group-readable is preferred;
+# running as root works out of the box.
+User=root
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the daemon is dumb on purpose — it reads counters and serves a
+# local socket, nothing else.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/sys/class/powercap
+
+[Install]
+WantedBy=multi-user.target
