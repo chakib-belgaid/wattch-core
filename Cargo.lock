@@ -416,7 +416,9 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
+ "thiserror",
  "wattch-core",
+ "wattch-daemon",
  "wattch-protocol",
 ]
 
