@@ -44,6 +44,64 @@ local Unix socket
 
 Later transports may include TCP or named pipes, but the initial production boundary is a local daemon installed by an administrator.
 
+## Wire format (v0.1)
+
+Every message is one frame:
+
+```text
+magic            4 bytes   "WCH0"
+wire major       u16 LE    0
+wire minor       u16 LE    1
+frame kind       u16 LE
+flags            u16 LE    bit 0 reserved for future protobuf payloads
+payload length   u32 LE    max 16 MiB
+payload          JSON (v0.1)
+```
+
+Frame kinds and payloads:
+
+```text
+1   HelloRequest      client -> daemon   client_name, client_version, protocol_version
+2   HelloResponse     daemon -> client   daemon_name, daemon_version, protocol_version,
+                                         node_id, sources[]
+3   StartCapture      client -> daemon   run_id, interval_ms, source_ids[] (empty = all)
+4   StopCapture       client -> daemon   run_id
+5   StartCaptureAck   daemon -> client   run_id, accepted_source_ids[]
+6   StopCaptureAck    daemon -> client   run_id, batches_sent, samples_sent
+10  RawSampleBatch    daemon -> client   run_id, node_id, batch_sequence_no, samples[]
+11  EventBatch        reserved
+255 Error             daemon -> client   code, message
+```
+
+Session flow:
+
+```text
+connect
+  -> HelloRequest
+  <- HelloResponse (includes all source descriptors)
+  -> StartCapture
+  <- StartCaptureAck
+  <- RawSampleBatch ... (every interval_ms)
+  -> StopCapture
+  <- StopCaptureAck (after draining in-flight batches)
+  (another StartCapture, or disconnect)
+```
+
+One capture per connection at a time. Protocol violations are answered with
+an Error frame; an unknown source id rejects the StartCapture but keeps the
+session alive.
+
+Error codes:
+
+```text
+1   PROTOCOL_VIOLATION
+2   UNSUPPORTED_VERSION
+3   UNKNOWN_SOURCE_ID
+4   CAPTURE_ALREADY_ACTIVE
+5   NO_ACTIVE_CAPTURE
+100 INTERNAL
+```
+
 ## Privilege model
 
 The daemon may run with elevated privileges when required by a backend.

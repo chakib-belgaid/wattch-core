@@ -24,22 +24,18 @@ That includes direct energy, runtime, wakeups, C-state behavior, scheduling effe
 
 ## Current phase
 
-This repository starts after the MVP validation phase.
-
-The goal of the first production foundation is:
+The production foundation is implemented end to end:
 
 ```text
-strict protocol
+strict protocol v0.1 over local Unix sockets (binary frames, JSON payloads)
 clear daemon/client boundary
-deterministic energy and telemetry daemon
-CLI capture/inspect/validate workflow
-replayable trace artifacts
-future-safe path for privileged RAPL acquisition
+wattch-powerd powermeter daemon: linux-rapl (powercap) + synthetic backends
+wattch-testd deterministic daemon for protocol validation and golden tests
+CLI capture/inspect/validate workflow with replayable trace artifacts
+pywattch Python client: updated pyJoules-compatible API
+pyinstrument energy profiler (time-share attribution, clearly labelled)
+energy tests: discovery + runner CLI + VSCode "Energy Tests" extension
 ```
-
-This phase does **not** start with real RAPL.
-
-Real RAPL comes after the deterministic daemon validates the protocol and trace semantics.
 
 ## Why the daemon boundary matters
 
@@ -68,36 +64,46 @@ crates/wattch-core
   shared domain primitives: source descriptors, units, evidence classes, samples, manifests, validation
 
 crates/wattch-protocol
-  protocol framing primitives and wire-version constants
+  frame envelope, typed v0.1 messages, stream read/write helpers
+
+crates/wattch-daemon
+  shared daemon runtime: socket server, session state machine, batching, sequence numbers
+
+crates/wattch-powerd
+  powermeter daemon: linux-rapl (powercap sysfs) and synthetic backends
 
 crates/wattch-testd
-  deterministic daemon used to validate protocol, CLI, and trace handling before real hardware support
+  deterministic daemon serving scenario files over the same protocol
 
 crates/wattch-cli
-  user-facing command skeleton for source discovery, capture, inspection, and validation
+  wattch sources / capture / inspect / validate against a live daemon
+
+clients/python
+  pywattch: protocol client, pyJoules-compatible meter API, handlers,
+  pyinstrument energy profiler, energy test discovery + runner CLI
+
+editors/vscode-energy-tests
+  VSCode extension: Energy Tests view and results tab
+
+packaging/
+  systemd unit for wattch-powerd
 
 proto/wattch/v0/wattch.proto
   canonical protocol schema draft
 
-docs/protocol-v0.md
-  protocol rules and invariants
-
+docs/protocol-v0.md     protocol rules, wire format, invariants
+docs/powerd.md          powermeter daemon install and privilege model
+docs/energy-tests.md    energy test conventions and semantics
 docs/architecture-start.md
-  starting-phase architecture
 
-examples/scenarios
-  deterministic multi-source scenarios
-
-examples/bench
-  benchmark specs used later by the benchmark layer
+examples/scenarios      deterministic multi-source scenarios
+examples/energy-tests   demo energy test suite
+examples/bench          benchmark specs used later by the benchmark layer
 ```
 
-## Non-goals for the initial commit
-
-The first commit intentionally does not implement:
+## Non-goals (still later layers)
 
 ```text
-real RAPL acquisition
 NVML acquisition
 PowerAPI or HWPC Sensor adapters
 impact scoring
@@ -105,11 +111,7 @@ benchmark statistics
 MCP server
 HTML reports
 cluster coordinator
-pyJoules rewrite
-JouleHunter rewrite
 ```
-
-Those are later layers.
 
 ## Architecture rule
 
@@ -143,44 +145,67 @@ Interpretation belongs to offline preprocessing, benchmarking, claim analysis, a
 
 ## Quick start
 
-This initial commit is a foundation skeleton. The intended development loop is:
+Daemon + CLI:
 
 ```bash
-cargo fmt --all
-cargo test --workspace
+cargo build --workspace
+
+# powermeter daemon (auto picks linux-rapl when available, else synthetic)
+./target/debug/wattch-powerd --socket /tmp/wattch-powerd.sock &
+
+./target/debug/wattch sources --socket /tmp/wattch-powerd.sock
+./target/debug/wattch capture --socket /tmp/wattch-powerd.sock --out runs --duration-ms 2000
+./target/debug/wattch inspect --run runs/<run-id>
+```
+
+Python (updated pyJoules API):
+
+```bash
+cd clients/python && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,profiler]'
+```
+
+```python
+from pywattch import EnergyMeter
+
+with EnergyMeter(socket_path="/tmp/wattch-powerd.sock") as meter:
+    workload()
+print(meter.get_trace().total_joules)
+```
+
+Energy tests (and the VSCode "Energy Tests" extension on top of them):
+
+```bash
+python -m pywattch.energytest run --root examples/energy-tests \
+    --socket /tmp/wattch-powerd.sock --json
+```
+
+Deterministic daemon for protocol work and golden tests:
+
+```bash
 cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested.json --socket /tmp/wattch-testd.sock
-cargo run -p wattch-cli -- sources --socket /tmp/wattch-testd.sock
 ```
 
-The deterministic daemon is the first acceptance target. It should make it possible to test multi-source traces without privileged hardware access.
+Verification gate:
 
-## Compatibility direction
+```bash
+cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+clients/python/.venv/bin/python -m pytest clients/python/tests
+cd editors/vscode-energy-tests && npm run build && npm test
+```
 
-Future pyJoules integration:
+## Layering
 
 ```text
-pyJoules user API
+pyJoules-style user API / JouleHunter-style profiler / energy tests / VSCode
   ↓
-Wattch client
+pywattch client (unprivileged)
   ↓
-rapl-wattchd local socket
+wattch-powerd local socket (privileged when the backend needs it)
   ↓
-privileged RAPL read
+raw counters: linux-rapl powercap, synthetic, future NVML/...
 ```
 
-Future JouleHunter integration:
-
-```text
-JouleHunter profiler
-  ↓
-Wattch capture session markers
-  ↓
-rapl-wattchd samples
-  ↓
-offline trace/profile correlation
-```
-
-Future HWPC Sensor integration is out of scope for now. It may later become a socket/import adapter, not a core dependency.
+Future HWPC Sensor integration remains out of scope. It may later become a socket/import adapter, not a core dependency.
 
 ## License
 
