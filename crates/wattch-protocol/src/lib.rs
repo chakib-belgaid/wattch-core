@@ -7,6 +7,7 @@
 //! serialization should remain swappable while the schema stabilizes.
 
 pub mod frame;
+pub mod messages;
 
 pub const PROTOCOL_NAME: &str = "wattch";
 pub const PROTOCOL_VERSION: &str = "0.1.0";

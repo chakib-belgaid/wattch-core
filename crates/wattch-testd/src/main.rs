@@ -80,7 +80,8 @@ fn main() -> Result<()> {
 fn load_scenario(path: &PathBuf) -> Result<Scenario> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read scenario {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse scenario {}", path.display()))
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse scenario {}", path.display()))
 }
 
 fn generate_batches(scenario: &Scenario) -> impl Iterator<Item = RawSampleBatch> + '_ {
@@ -92,7 +93,9 @@ fn generate_batches(scenario: &Scenario) -> impl Iterator<Item = RawSampleBatch>
                 source_id: source.descriptor.local_source_id,
                 sequence_no: tick,
                 monotonic_ns: tick * scenario.tick_ns,
-                value: RawValue::F64(source.behavior.start + source.behavior.step_per_tick * tick as f64),
+                value: RawValue::F64(
+                    source.behavior.start + source.behavior.step_per_tick * tick as f64,
+                ),
             })
             .collect();
 
