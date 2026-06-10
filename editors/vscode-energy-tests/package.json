@@ -1,0 +1,122 @@
+{
+  "name": "wattch-energy-tests",
+  "displayName": "Energy Tests",
+  "description": "Run energy tests (unit tests for joules) through a Wattch daemon and see per-test energy consumption.",
+  "version": "0.1.0",
+  "publisher": "wattch",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chakib-belgaid/wattch-core"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "energyTests",
+          "title": "Energy Tests",
+          "icon": "media/energy.svg"
+        }
+      ]
+    },
+    "views": {
+      "energyTests": [
+        {
+          "id": "energyTests.testTree",
+          "name": "Energy Tests",
+          "icon": "media/energy.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "energyTests.refresh",
+        "title": "Energy Tests: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "energyTests.runAll",
+        "title": "Energy Tests: Run All",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "energyTests.runTest",
+        "title": "Energy Tests: Run Test",
+        "icon": "$(run)"
+      },
+      {
+        "command": "energyTests.openResults",
+        "title": "Energy Tests: Open Results"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "energyTests.runAll",
+          "when": "view == energyTests.testTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "energyTests.refresh",
+          "when": "view == energyTests.testTree",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "energyTests.runTest",
+          "when": "view == energyTests.testTree && viewItem == energyTest",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Energy Tests",
+      "properties": {
+        "energyTests.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter with pywattch installed."
+        },
+        "energyTests.socketPath": {
+          "type": "string",
+          "default": "/tmp/wattch-powerd.sock",
+          "description": "Wattch daemon socket (wattch-powerd or wattch-testd)."
+        },
+        "energyTests.rootDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory to scan for energy tests. Empty means the workspace root."
+        },
+        "energyTests.intervalMs": {
+          "type": "number",
+          "default": 10,
+          "description": "Sampling interval in milliseconds."
+        },
+        "energyTests.repeat": {
+          "type": "number",
+          "default": 0,
+          "description": "Override per-test repeat count (0 keeps each test's own setting)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "tsc && node --test \"out/test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

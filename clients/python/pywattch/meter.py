@@ -186,6 +186,11 @@ class EnergyMeter:
     def stop(self) -> None:
         if self._client is None:
             return
+        # Wait for one sample taken after this instant so the final marker
+        # covers all work done before stop(). Without this, phases shorter
+        # than the sampling interval would report 0 J; with it they may
+        # include up to one extra interval of idle energy instead.
+        self._wait_for_fresh_sample()
         self._mark("__stop__")
         self._stop_requested.set()
         if self._reader is not None:
@@ -223,6 +228,16 @@ class EnergyMeter:
         ]
 
     # -- internals -----------------------------------------------------------
+
+    def _wait_for_fresh_sample(self) -> None:
+        with self._lock:
+            seen_ns = self._latest_ns
+        deadline = time.monotonic() + max(3 * self.interval_ms / 1000.0, 0.1)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._latest_ns > seen_ns:
+                    return
+            time.sleep(self.interval_ms / 2000.0)
 
     def _mark(self, tag: str) -> None:
         with self._lock:
