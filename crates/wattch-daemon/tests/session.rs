@@ -196,11 +196,9 @@ fn capture_streams_monotonic_batches_then_acks_stop() {
         Message::StartCaptureAck(ack) => assert_eq!(ack.accepted_source_ids, vec![1]),
         other => panic!("expected StartCaptureAck, got {other:?}"),
     }
-    let next_batch = loop {
-        match read_message(&mut stream).unwrap() {
-            Message::RawSampleBatch(batch) => break batch,
-            other => panic!("expected RawSampleBatch, got {other:?}"),
-        }
+    let next_batch = match read_message(&mut stream).unwrap() {
+        Message::RawSampleBatch(batch) => batch,
+        other => panic!("expected RawSampleBatch, got {other:?}"),
     };
     assert_eq!(next_batch.batch_sequence_no, batches.len() as u64);
     assert_eq!(next_batch.samples.len(), 1);
