@@ -429,6 +429,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wattch-daemon"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "wattch-core",
+ "wattch-protocol",
+]
+
+[[package]]
 name = "wattch-protocol"
 version = "0.1.0"
 dependencies = [

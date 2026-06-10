@@ -2,6 +2,7 @@
 members = [
   "crates/wattch-core",
   "crates/wattch-protocol",
+  "crates/wattch-daemon",
   "crates/wattch-testd",
   "crates/wattch-cli",
 ]
@@ -24,3 +25,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wattch-core = { path = "crates/wattch-core" }
 wattch-protocol = { path = "crates/wattch-protocol" }
+wattch-daemon = { path = "crates/wattch-daemon" }
