@@ -13,13 +13,22 @@ from ._messages import (
     SourceDescriptor,
 )
 from .client import DEFAULT_SOCKET_PATH, WattchClient, default_socket_path
+from .energytest import energy_test
 from .errors import (
     WattchConnectionError,
     WattchDaemonError,
     WattchError,
     WattchProtocolError,
 )
-from .meter import EnergyContext, EnergyMeter, EnergySample, EnergyTrace, measure_energy
+from .handlers import CSVHandler, PrintHandler
+from .meter import (
+    EnergyContext,
+    EnergyMeter,
+    EnergySample,
+    EnergyTrace,
+    domains_of,
+    measure_energy,
+)
 
 __version__ = "0.1.0"
 
@@ -27,10 +36,13 @@ __all__ = [
     "DEFAULT_SOCKET_PATH",
     "PROTOCOL_VERSION",
     "default_socket_path",
+    "CSVHandler",
     "EnergyContext",
     "EnergyMeter",
+    "EnergyProfiler",
     "EnergySample",
     "EnergyTrace",
+    "PrintHandler",
     "RawSample",
     "RawSampleBatch",
     "SourceDescriptor",
@@ -39,6 +51,18 @@ __all__ = [
     "WattchDaemonError",
     "WattchError",
     "WattchProtocolError",
+    "domains_of",
+    "energy_test",
     "measure_energy",
     "__version__",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily import EnergyProfiler so bare `import pywattch` doesn't need
+    the optional `pyinstrument` dependency (see the `profiler` extra)."""
+    if name == "EnergyProfiler":
+        from .profiler import EnergyProfiler
+
+        return EnergyProfiler
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
