@@ -49,6 +49,16 @@ def test_python_client_speaks_to_rust_daemon(testd):
     assert all(len(batch.samples) == 6 for batch in batches)
 
 
+def test_abandoned_stream_leaves_connection_usable(testd):
+    with WattchClient(testd) as client:
+        stream = client.stream("run-abandoned", interval_ms=10)
+        assert next(stream).samples
+        stream.close()  # abandon mid-capture: must stop and drain
+
+        batches = client.capture(duration_s=0.05, interval_ms=10)
+    assert batches
+
+
 def test_energy_meter_against_rust_daemon(testd):
     with EnergyMeter(testd, interval_ms=10) as meter:
         time.sleep(0.08)

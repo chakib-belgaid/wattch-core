@@ -127,19 +127,32 @@ class WattchClient:
         source_ids: list[int] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[RawSampleBatch]:
-        """Yield batches until `should_stop()` is true, then stop cleanly."""
+        """Yield batches until `should_stop()` is true, then stop cleanly.
+
+        Abandoning the iterator early (``break``, ``close()``) also stops the
+        capture and drains in-flight batches, so the connection stays usable.
+        """
         self.start_capture(run_id, interval_ms, source_ids)
         stopping = False
-        while True:
-            if not stopping and should_stop is not None and should_stop():
+        try:
+            while True:
+                if not stopping and should_stop is not None and should_stop():
+                    write_frame(
+                        self._sock, FrameKind.STOP_CAPTURE, encode_stop_capture(run_id)
+                    )
+                    stopping = True
+                message = self.read_batch()
+                if isinstance(message, StopCaptureAck):
+                    return
+                yield message
+        except GeneratorExit:
+            if not stopping:
                 write_frame(
                     self._sock, FrameKind.STOP_CAPTURE, encode_stop_capture(run_id)
                 )
-                stopping = True
-            message = self.read_batch()
-            if isinstance(message, StopCaptureAck):
-                return
-            yield message
+            while not isinstance(self.read_batch(), StopCaptureAck):
+                pass
+            raise
 
     def capture(
         self,
