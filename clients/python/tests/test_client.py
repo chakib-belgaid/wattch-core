@@ -53,3 +53,13 @@ def test_unknown_source_id_raises_daemon_error(fake_daemon):
 def test_missing_socket_raises_connection_error():
     with pytest.raises(WattchConnectionError, match="failed to connect"):
         WattchClient("/tmp/wattch-missing-socket.sock")
+
+
+def test_abandoned_stream_leaves_connection_usable(fake_daemon):
+    with WattchClient(fake_daemon.socket_path) as client:
+        stream = client.stream("run-abandoned", interval_ms=5)
+        assert next(stream).samples
+        stream.close()  # abandon mid-capture: must stop and drain
+
+        batches = client.capture(duration_s=0.05, interval_ms=5)
+    assert batches
