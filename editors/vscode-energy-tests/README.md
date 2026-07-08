@@ -49,7 +49,7 @@ the way assertion failures do.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `energyTests.pythonPath` | `python3` | Interpreter with pywattch installed |
-| `energyTests.socketPath` | `/tmp/wattch-powerd.sock` | Wattch daemon socket |
+| `energyTests.socketPath` | `` (auto-detect) | Wattch daemon socket; empty lets the Python client resolve it |
 | `energyTests.rootDir` | workspace root | Directory scanned for tests |
 | `energyTests.intervalMs` | `10` | Sampling interval |
 | `energyTests.repeat` | `0` | Override per-test repeat (0 = keep) |

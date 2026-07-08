@@ -151,10 +151,10 @@ Daemon + CLI:
 cargo build --workspace
 
 # powermeter daemon (auto picks linux-rapl when available, else synthetic)
-./target/debug/wattch-powerd --socket /tmp/wattch-powerd.sock &
+./target/debug/wattch-powerd &
 
-./target/debug/wattch sources --socket /tmp/wattch-powerd.sock
-./target/debug/wattch capture --socket /tmp/wattch-powerd.sock --out runs --duration-ms 2000
+./target/debug/wattch sources
+./target/debug/wattch capture --out runs --duration-ms 2000
 ./target/debug/wattch inspect --run runs/<run-id>
 ```
 
@@ -167,7 +167,7 @@ cd clients/python && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,pr
 ```python
 from pywattch import EnergyMeter
 
-with EnergyMeter(socket_path="/tmp/wattch-powerd.sock") as meter:
+with EnergyMeter() as meter:
     workload()
 print(meter.get_trace().total_joules)
 ```
@@ -175,14 +175,13 @@ print(meter.get_trace().total_joules)
 Energy tests (and the VSCode "Energy Tests" extension on top of them):
 
 ```bash
-python -m pywattch.energytest run --root examples/energy-tests \
-    --socket /tmp/wattch-powerd.sock --json
+python -m pywattch.energytest run --root examples/energy-tests --json
 ```
 
 Deterministic daemon for protocol work and golden tests:
 
 ```bash
-cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested.json --socket /tmp/wattch-testd.sock
+cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested.json
 ```
 
 Verification gate:

@@ -67,12 +67,13 @@ export async function runTests(
     "run",
     "--root",
     config.rootDir,
-    "--socket",
-    config.socketPath,
     "--interval-ms",
     String(config.intervalMs),
     "--json",
   ];
+  if (config.socketPath) {
+    args.push("--socket", config.socketPath);
+  }
   if (config.repeat > 0) {
     args.push("--repeat", String(config.repeat));
   }

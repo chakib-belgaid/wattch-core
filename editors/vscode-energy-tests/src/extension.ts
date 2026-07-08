@@ -16,7 +16,7 @@ function readConfig(): RunnerConfig | undefined {
   }
   return {
     pythonPath: settings.get<string>("pythonPath", "python3"),
-    socketPath: settings.get<string>("socketPath", "/tmp/wattch-powerd.sock"),
+    socketPath: settings.get<string>("socketPath", ""),
     intervalMs: settings.get<number>("intervalMs", 10),
     repeat: settings.get<number>("repeat", 0),
     rootDir,

@@ -88,8 +88,8 @@
         },
         "energyTests.socketPath": {
           "type": "string",
-          "default": "/tmp/wattch-powerd.sock",
-          "description": "Wattch daemon socket (wattch-powerd or wattch-testd)."
+          "default": "",
+          "description": "Wattch daemon socket (wattch-powerd or wattch-testd). Empty means auto-detect: the Python client resolves the daemon socket itself."
         },
         "energyTests.rootDir": {
           "type": "string",

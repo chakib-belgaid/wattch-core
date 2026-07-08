@@ -11,7 +11,7 @@ from pywattch import EnergyMeter, EnergyContext, measure_energy
 from pywattch.handlers import PrintHandler, CSVHandler
 
 # Explicit meter
-meter = EnergyMeter(socket_path="/tmp/wattch-powerd.sock")
+meter = EnergyMeter()
 meter.start(tag="setup")
 load_data()
 meter.record(tag="compute")
@@ -44,8 +44,8 @@ Extras:
 Start one of the Wattch daemons first:
 
 ```bash
-wattch-powerd --backend synthetic --socket /tmp/wattch-powerd.sock   # dev
-sudo wattch-powerd --backend linux-rapl                              # Linux RAPL
+wattch-powerd --backend synthetic       # dev
+sudo wattch-powerd --backend linux-rapl # Linux RAPL
 ```
 
 ## Semantics
