@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -371,16 +371,20 @@ fn run_capture(
     batch_sequence_no: &mut u64,
 ) -> Result<CaptureEnd, WireError> {
     let stop_flag = AtomicBool::new(false);
+    // Tracked outside the producer closure so a mid-capture write error or
+    // panic can't discard counts for batches that were already sent: the
+    // ack must report what actually went out, regardless of how the
+    // producer thread exited.
+    let batches_sent_counter = AtomicU64::new(0);
+    let samples_sent_counter = AtomicU64::new(0);
     let mut writer = stream.try_clone()?;
     let mut reader = stream.try_clone()?;
 
     thread::scope(|scope| {
-        let producer = scope.spawn(|| -> Result<(u64, u64), WireError> {
-            let mut batches_sent: u64 = 0;
-            let mut samples_sent: u64 = 0;
+        let producer = scope.spawn(|| -> Result<(), WireError> {
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
-                    return Ok((batches_sent, samples_sent));
+                    return Ok(());
                 }
 
                 let monotonic_ns = session_start.elapsed().as_nanos() as u64;
@@ -408,8 +412,8 @@ fn run_capture(
                     samples,
                 };
                 *batch_sequence_no += 1;
-                samples_sent += batch.samples.len() as u64;
-                batches_sent += 1;
+                samples_sent_counter.fetch_add(batch.samples.len() as u64, Ordering::SeqCst);
+                batches_sent_counter.fetch_add(1, Ordering::SeqCst);
                 write_message(&mut writer, &Message::RawSampleBatch(batch))?;
 
                 // Sleep in small slices so StopCapture latency stays low
@@ -417,7 +421,7 @@ fn run_capture(
                 let mut remaining = interval;
                 while !remaining.is_zero() {
                     if stop_flag.load(Ordering::SeqCst) {
-                        return Ok((batches_sent, samples_sent));
+                        return Ok(());
                     }
                     let slice = remaining.min(Duration::from_millis(20));
                     thread::sleep(slice);
@@ -433,10 +437,12 @@ fn run_capture(
         };
         stop_flag.store(true, Ordering::SeqCst);
 
-        let (batches_sent, samples_sent) = match producer.join() {
-            Ok(Ok(counts)) => counts,
-            Ok(Err(_)) | Err(_) => (0, 0),
-        };
+        // The producer's own Ok/Err/panic outcome is intentionally not
+        // propagated here (unchanged from before); only how the counts are
+        // obtained has changed, so they survive a mid-capture failure.
+        let _ = producer.join();
+        let batches_sent = batches_sent_counter.load(Ordering::SeqCst);
+        let samples_sent = samples_sent_counter.load(Ordering::SeqCst);
 
         Ok(match end {
             Some(end) => end,
@@ -456,6 +462,49 @@ fn compatible_version(client_version: &str) -> bool {
         (major, minor)
     };
     prefix(client_version) == prefix(PROTOCOL_VERSION)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::compatible_version;
+    use wattch_protocol::PROTOCOL_VERSION;
+
+    // PROTOCOL_VERSION is "0.1.0" today; these tests pin the semantics
+    // (same major+minor accepted regardless of patch, anything else
+    // rejected) rather than the literal string, so they keep meaning if it
+    // changes.
+
+    #[test]
+    fn identical_version_is_compatible() {
+        assert!(compatible_version(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn same_major_minor_different_patch_is_compatible() {
+        assert!(compatible_version("0.1.0"));
+        assert!(compatible_version("0.1.99"));
+    }
+
+    #[test]
+    fn older_minor_is_incompatible() {
+        assert!(!compatible_version("0.0.9"));
+    }
+
+    #[test]
+    fn newer_minor_is_incompatible() {
+        assert!(!compatible_version("0.2.0"));
+    }
+
+    #[test]
+    fn different_major_is_incompatible() {
+        assert!(!compatible_version("1.1.0"));
+    }
+
+    #[test]
+    fn malformed_version_is_incompatible() {
+        assert!(!compatible_version(""));
+        assert!(!compatible_version("garbage"));
+    }
 }
 
 #[cfg(test)]

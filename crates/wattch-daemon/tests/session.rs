@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wattch_core::{
     EvidenceClass, RawValue, SamplingMode, SourceDescriptor, SourceKind, Temporality, Unit,
@@ -297,6 +299,128 @@ fn malformed_payload_is_rejected() {
         Message::Error(err) => assert_eq!(err.code, error_codes::PROTOCOL_VIOLATION),
         other => panic!("expected Error, got {other:?}"),
     }
+
+    handle.shutdown();
+}
+
+/// A backend that samples cleanly `panic_after` times, then panics on the
+/// next `sample()` call (simulating a producer that dies mid-capture), first
+/// flipping `panicked` so tests can wait for the panic to have actually
+/// happened before racing it against a `StopCapture`.
+struct FlakyBackend {
+    descriptors: Vec<SourceDescriptor>,
+    calls: u32,
+    panic_after: u32,
+    panicked: Arc<AtomicBool>,
+}
+
+impl SampleBackend for FlakyBackend {
+    fn descriptors(&self) -> &[SourceDescriptor] {
+        &self.descriptors
+    }
+
+    fn sample(&mut self) -> Vec<(u32, RawValue)> {
+        self.calls += 1;
+        if self.calls > self.panic_after {
+            self.panicked.store(true, Ordering::SeqCst);
+            panic!("simulated backend failure after {} calls", self.panic_after);
+        }
+        vec![
+            (1, RawValue::F64(100.0 + self.calls as f64)),
+            (2, RawValue::F64(200.0 + self.calls as f64)),
+        ]
+    }
+}
+
+#[test]
+fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panic_after: u32 = 3;
+
+    let socket_path = std::env::temp_dir().join(format!(
+        "wattch-daemon-test-panic-counts-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let factory_panicked = Arc::clone(&panicked);
+    let handle = spawn(
+        ServerConfig {
+            socket_path: socket_path.clone(),
+            identity: DaemonIdentity {
+                daemon_name: "wattch-daemon-test".to_string(),
+                daemon_version: "0.0.0".to_string(),
+                node_id: "node-test".to_string(),
+            },
+        },
+        move || {
+            Box::new(FlakyBackend {
+                descriptors: vec![
+                    descriptor(1, "cpu/package/0/energy"),
+                    descriptor(2, "cpu/package/1/energy"),
+                ],
+                calls: 0,
+                panic_after,
+                panicked: Arc::clone(&factory_panicked),
+            })
+        },
+    )
+    .expect("server should start");
+
+    let mut stream = UnixStream::connect(&socket_path).unwrap();
+    hello(&mut stream);
+
+    write_message(
+        &mut stream,
+        &Message::StartCapture(StartCapture {
+            run_id: "run-panic".to_string(),
+            interval_ms: 5,
+            source_ids: vec![],
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message(&mut stream).unwrap(),
+        Message::StartCaptureAck(_)
+    ));
+
+    let mut batches = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while batches.len() < panic_after as usize {
+        assert!(Instant::now() < deadline, "timed out waiting for batches");
+        match read_message(&mut stream).unwrap() {
+            Message::RawSampleBatch(batch) => batches.push(batch),
+            other => panic!("expected RawSampleBatch, got {other:?}"),
+        }
+    }
+
+    // Wait until the producer has actually panicked on its next sample()
+    // call, so the StopCapture below is guaranteed to race a dead producer
+    // rather than a live one still mid-batch.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !panicked.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "producer never panicked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    write_message(
+        &mut stream,
+        &Message::StopCapture(StopCapture {
+            run_id: "run-panic".to_string(),
+        }),
+    )
+    .unwrap();
+
+    let ack = match read_message(&mut stream).unwrap() {
+        Message::StopCaptureAck(ack) => ack,
+        other => panic!("expected StopCaptureAck, got {other:?}"),
+    };
+
+    assert_eq!(
+        ack.batches_sent, panic_after as u64,
+        "counts must reflect batches actually sent, not be zeroed out by the producer panic"
+    );
+    assert_eq!(ack.samples_sent, panic_after as u64 * 2);
 
     handle.shutdown();
 }
