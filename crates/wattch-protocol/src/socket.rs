@@ -44,9 +44,14 @@ pub fn default_connect_candidates(name: &str) -> Vec<PathBuf> {
 }
 
 fn xdg_runtime_dir() -> Option<String> {
-    env::var(XDG_RUNTIME_DIR_VAR)
-        .ok()
-        .filter(|dir| !dir.is_empty())
+    filter_xdg_runtime_dir(env::var(XDG_RUNTIME_DIR_VAR).ok())
+}
+
+/// Pure filtering logic behind `xdg_runtime_dir`, split out so the
+/// empty-string-means-unset rule can be unit tested directly without
+/// mutating the process environment (see module tests).
+fn filter_xdg_runtime_dir(value: Option<String>) -> Option<String> {
+    value.filter(|dir| !dir.is_empty())
 }
 
 /// Per-uid fallback filename, e.g. `wattch-powerd-501.sock` from
@@ -156,25 +161,21 @@ mod tests {
     }
 
     #[test]
-    fn xdg_runtime_dir_env_driven_reads_var() {
-        // env vars are process-global; use a unique name via a lock-free
-        // read-then-restore so this test is safe next to others that don't
-        // touch XDG_RUNTIME_DIR.
-        let previous = env::var(XDG_RUNTIME_DIR_VAR).ok();
+    fn filter_xdg_runtime_dir_unset_stays_none() {
+        assert_eq!(filter_xdg_runtime_dir(None), None);
+    }
 
-        env::remove_var(XDG_RUNTIME_DIR_VAR);
-        assert_eq!(xdg_runtime_dir(), None);
+    #[test]
+    fn filter_xdg_runtime_dir_treats_empty_as_unset() {
+        assert_eq!(filter_xdg_runtime_dir(Some(String::new())), None);
+    }
 
-        env::set_var(XDG_RUNTIME_DIR_VAR, "");
-        assert_eq!(xdg_runtime_dir(), None);
-
-        env::set_var(XDG_RUNTIME_DIR_VAR, "/run/user/501");
-        assert_eq!(xdg_runtime_dir(), Some("/run/user/501".to_string()));
-
-        match previous {
-            Some(value) => env::set_var(XDG_RUNTIME_DIR_VAR, value),
-            None => env::remove_var(XDG_RUNTIME_DIR_VAR),
-        }
+    #[test]
+    fn filter_xdg_runtime_dir_passes_through_non_empty() {
+        assert_eq!(
+            filter_xdg_runtime_dir(Some("/run/user/501".to_string())),
+            Some("/run/user/501".to_string())
+        );
     }
 
     #[test]
