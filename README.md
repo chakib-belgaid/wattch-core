@@ -192,6 +192,10 @@ clients/python/.venv/bin/python -m pytest clients/python/tests
 cd editors/vscode-energy-tests && npm run build && npm test
 ```
 
+### Development
+
+Run `just --list` to see the available recipes (`build`, `test`, `test-rust`, `test-python`, `test-ext`, `lint`, `fmt`) — they wrap the commands above. CI runs `cargo fmt`, `cargo clippy`, and the Rust/Python/extension test suites on every push to `main` and every pull request.
+
 ## Layering
 
 ```text
