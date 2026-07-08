@@ -112,6 +112,18 @@ fn main() -> Result<()> {
         backend,
         handle.socket_path().display()
     );
-    handle.wait();
+
+    // `ServerHandle::shutdown` consumes `self` and unlinks the socket file;
+    // `handle.wait()` alone never calls it, so Ctrl-C (or SIGTERM) would
+    // leave a stale socket behind. Route the signal through a channel
+    // instead of blocking on `wait()`, then shut down explicitly so the
+    // socket is always removed on the way out.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = stop_tx.send(());
+    })
+    .context("failed to install signal handler")?;
+    let _ = stop_rx.recv();
+    handle.shutdown();
     Ok(())
 }
