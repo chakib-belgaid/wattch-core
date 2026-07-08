@@ -20,8 +20,12 @@ enum BackendChoice {
 #[command(about = "Wattch powermeter daemon: privileged acquisition behind a local socket")]
 struct Args {
     /// Unix socket path to serve the Wattch protocol on.
-    #[arg(long, default_value = "/tmp/wattch-powerd.sock")]
-    socket: PathBuf,
+    ///
+    /// Defaults to (in order of preference): /run/wattch/wattch-powerd.sock
+    /// when running as root, $XDG_RUNTIME_DIR/wattch/wattch-powerd.sock, or
+    /// a per-uid path under /tmp. See docs/powerd.md for the full model.
+    #[arg(long)]
+    socket: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     backend: BackendChoice,
@@ -87,9 +91,13 @@ fn main() -> Result<()> {
         BackendChoice::Auto => unreachable!("auto resolved above"),
     };
 
+    let socket_path = args
+        .socket
+        .unwrap_or_else(|| wattch_protocol::socket::default_bind_path("wattch-powerd.sock"));
+
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path: args.socket,
+            socket_path,
             identity: DaemonIdentity {
                 daemon_name: "wattch-powerd".to_string(),
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),

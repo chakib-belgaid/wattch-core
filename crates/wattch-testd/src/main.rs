@@ -12,8 +12,12 @@ struct Args {
     scenario: PathBuf,
 
     /// Unix socket path to serve the Wattch protocol on.
-    #[arg(long, default_value = "/tmp/wattch-testd.sock")]
-    socket: PathBuf,
+    ///
+    /// Defaults to (in order of preference): /run/wattch/wattch-testd.sock
+    /// when running as root, $XDG_RUNTIME_DIR/wattch/wattch-testd.sock, or a
+    /// per-uid path under /tmp.
+    #[arg(long)]
+    socket: Option<PathBuf>,
 
     /// Print generated batches instead of binding the socket.
     #[arg(long)]
@@ -49,9 +53,13 @@ fn main() -> Result<()> {
         node_id: scenario.node_id.clone(),
     };
 
+    let socket_path = args
+        .socket
+        .unwrap_or_else(|| wattch_protocol::socket::default_bind_path("wattch-testd.sock"));
+
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path: args.socket,
+            socket_path,
             identity,
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
