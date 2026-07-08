@@ -108,7 +108,10 @@ class WattchClient:
             encode_hello_request(client_name, __version__),
         )
         hello = self._read_expected(FrameKind.HELLO_RESPONSE, "HelloResponse")
-        assert isinstance(hello, HelloResponse)
+        if not isinstance(hello, HelloResponse):
+            raise WattchProtocolError(
+                f"expected HelloResponse, decoded {type(hello).__name__}"
+            )
         self.hello: HelloResponse = hello
 
     # -- introspection -----------------------------------------------------
@@ -141,7 +144,10 @@ class WattchClient:
             encode_start_capture(run_id, interval_ms, source_ids or []),
         )
         ack = self._read_expected(FrameKind.START_CAPTURE_ACK, "StartCaptureAck")
-        assert isinstance(ack, StartCaptureAck)
+        if not isinstance(ack, StartCaptureAck):
+            raise WattchProtocolError(
+                f"expected StartCaptureAck, decoded {type(ack).__name__}"
+            )
         return ack
 
     def read_batch(self) -> RawSampleBatch | StopCaptureAck:

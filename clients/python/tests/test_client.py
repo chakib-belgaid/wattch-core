@@ -1,6 +1,8 @@
 import pytest
 
-from pywattch import WattchClient, WattchConnectionError, WattchDaemonError
+from pywattch import WattchClient, WattchConnectionError, WattchDaemonError, WattchProtocolError
+from pywattch import client as client_module
+from pywattch._messages import StartCaptureAck
 
 
 def test_hello_exposes_sources(fake_daemon):
@@ -53,6 +55,31 @@ def test_unknown_source_id_raises_daemon_error(fake_daemon):
 def test_missing_socket_raises_connection_error():
     with pytest.raises(WattchConnectionError, match="failed to connect"):
         WattchClient("/tmp/wattch-missing-socket.sock")
+
+
+def test_hello_with_wrong_message_type_raises_protocol_error(fake_daemon, monkeypatch):
+    # Simulate a decode_payload bug/drift that hands back a message whose
+    # type doesn't match the frame kind it was decoded for.
+    bogus = StartCaptureAck(run_id="not-a-hello", accepted_source_ids=())
+    monkeypatch.setattr(client_module, "decode_payload", lambda kind, payload: bogus)
+    with pytest.raises(WattchProtocolError, match="HelloResponse"):
+        WattchClient(fake_daemon.socket_path)
+
+
+def test_start_capture_with_wrong_message_type_raises_protocol_error(fake_daemon, monkeypatch):
+    from pywattch._messages import HelloResponse
+
+    with WattchClient(fake_daemon.socket_path) as client:
+        bogus = HelloResponse(
+            daemon_name="x",
+            daemon_version="0",
+            protocol_version="0.1.0",
+            node_id="fake-node",
+            sources=(),
+        )
+        monkeypatch.setattr(client_module, "decode_payload", lambda kind, payload: bogus)
+        with pytest.raises(WattchProtocolError, match="StartCaptureAck"):
+            client.start_capture("run-x")
 
 
 def test_abandoned_stream_leaves_connection_usable(fake_daemon):
