@@ -12,7 +12,7 @@ from ._messages import (
     RawSampleBatch,
     SourceDescriptor,
 )
-from .client import DEFAULT_SOCKET_PATH, WattchClient
+from .client import DEFAULT_SOCKET_PATH, WattchClient, default_socket_path
 from .errors import (
     WattchConnectionError,
     WattchDaemonError,
@@ -26,6 +26,7 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_SOCKET_PATH",
     "PROTOCOL_VERSION",
+    "default_socket_path",
     "EnergyContext",
     "EnergyMeter",
     "EnergySample",

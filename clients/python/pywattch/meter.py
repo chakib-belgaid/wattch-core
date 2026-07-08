@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from ._messages import RawSampleBatch, SourceDescriptor, StopCaptureAck
-from .client import DEFAULT_SOCKET_PATH, WattchClient
+from .client import WattchClient
 from .errors import WattchError
 
 _ENERGY_UNIT_TO_JOULES = {"JOULE": 1.0, "MICROJOULE": 1e-6}
@@ -109,7 +109,7 @@ class EnergyMeter:
 
     Usage::
 
-        meter = EnergyMeter(socket_path="/tmp/wattch-powerd.sock")
+        meter = EnergyMeter()  # auto-detects the daemon socket
         meter.start(tag="setup")
         ...
         meter.record(tag="compute")
@@ -120,7 +120,7 @@ class EnergyMeter:
 
     def __init__(
         self,
-        socket_path: str = DEFAULT_SOCKET_PATH,
+        socket_path: str | None = None,
         interval_ms: int = 10,
         source_ids: list[int] | None = None,
         first_sample_timeout_s: float = 5.0,
@@ -336,7 +336,7 @@ class EnergyContext:
         self,
         handler: Callable[[EnergyTrace], None] | Any = None,
         tag: str = "start",
-        socket_path: str = DEFAULT_SOCKET_PATH,
+        socket_path: str | None = None,
         interval_ms: int = 10,
     ):
         self.handler = handler
@@ -362,7 +362,7 @@ def measure_energy(
     func: Callable | None = None,
     *,
     handler: Any = None,
-    socket_path: str = DEFAULT_SOCKET_PATH,
+    socket_path: str | None = None,
     interval_ms: int = 10,
     tag: str | None = None,
 ) -> Callable:

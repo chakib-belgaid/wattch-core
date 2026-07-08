@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 
-from ..client import DEFAULT_SOCKET_PATH
+from ..client import default_socket_path
 from .discovery import discover_tests
 from .runner import STATUS_PASSED, run_tests, summarize
 
@@ -27,7 +27,11 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="run energy tests")
     run.add_argument("--root", default=".", help="directory to scan")
     run.add_argument("--json", action="store_true", help="machine-readable output")
-    run.add_argument("--socket", default=DEFAULT_SOCKET_PATH, help="wattch daemon socket")
+    run.add_argument(
+        "--socket",
+        default=None,
+        help="wattch daemon socket (default: auto-detected, see docs/powerd.md)",
+    )
     run.add_argument("--interval-ms", type=int, default=10, help="sampling interval")
     run.add_argument("--repeat", type=int, default=None, help="override per-test repeat")
     run.add_argument(
@@ -39,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.command == "run" and args.socket is None:
+        # Resolve now (not at import time) so --json output reports the
+        # actual path probed/used, not a stale snapshot.
+        args.socket = default_socket_path()
     tests, errors = discover_tests(args.root)
 
     if args.command == "discover":

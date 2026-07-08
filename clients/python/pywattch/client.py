@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import time
 from typing import Callable, Iterator
@@ -24,7 +25,51 @@ from .errors import WattchConnectionError, WattchDaemonError, WattchProtocolErro
 
 __version__ = "0.1.0"
 
-DEFAULT_SOCKET_PATH = "/tmp/wattch-powerd.sock"
+# Fine-grained RAPL energy counters are a documented side channel (PLATYPUS,
+# CVE-2020-8694); wattch-powerd's socket -- not the RAPL files -- is the
+# actual security boundary, so where it lives matters. Mirrors the Rust
+# resolution in wattch_protocol::socket, highest-privilege first:
+#   1. /run/wattch/<name>              -- root-owned runtime dir (systemd).
+#   2. $XDG_RUNTIME_DIR/wattch/<name>  -- user-private runtime dir.
+#   3. /tmp/<stem>-<uid>.sock          -- per-uid fallback.
+RUN_WATTCH_SOCKET = "/run/wattch/wattch-powerd.sock"
+
+
+def _first_existing(
+    candidates: list[str], exists: Callable[[str], bool] = os.path.exists
+) -> str:
+    """The first candidate for which `exists` is true, else the first one."""
+    for candidate in candidates:
+        if exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def default_socket_candidates() -> list[str]:
+    """Candidate wattch-powerd socket paths, in priority order."""
+    candidates = [RUN_WATTCH_SOCKET]
+    xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime_dir:
+        candidates.append(os.path.join(xdg_runtime_dir, "wattch", "wattch-powerd.sock"))
+    candidates.append(f"/tmp/wattch-powerd-{os.getuid()}.sock")
+    return candidates
+
+
+def default_socket_path() -> str:
+    """The first existing candidate socket path, or the highest-priority one.
+
+    If none of the candidates exist, the highest-priority path is returned
+    anyway; connecting to it will raise `WattchConnectionError`, whose
+    message includes this path.
+    """
+    return _first_existing(default_socket_candidates())
+
+
+# Kept for backward compatibility: existing call sites (`meter.py`,
+# `profiler.py`, `energytest/`) import this constant. It is a snapshot taken
+# at import time, not env/uid-driven at call time -- prefer
+# `default_socket_path()` in new code.
+DEFAULT_SOCKET_PATH = default_socket_path()
 
 
 class WattchClient:
@@ -40,10 +85,11 @@ class WattchClient:
 
     def __init__(
         self,
-        socket_path: str = DEFAULT_SOCKET_PATH,
+        socket_path: str | None = None,
         client_name: str = "pywattch",
         connect_timeout_s: float = 5.0,
     ):
+        socket_path = socket_path if socket_path is not None else default_socket_path()
         self.socket_path = socket_path
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(connect_timeout_s)

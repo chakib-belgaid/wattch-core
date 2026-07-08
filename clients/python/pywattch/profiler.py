@@ -15,7 +15,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .client import DEFAULT_SOCKET_PATH
 from .errors import WattchError
 from .meter import EnergyMeter
 
@@ -117,7 +116,7 @@ class EnergyProfiler:
 
     Usage::
 
-        with EnergyProfiler(socket_path="/tmp/wattch-powerd.sock") as ep:
+        with EnergyProfiler() as ep:  # auto-detects the daemon socket
             workload()
         print(ep.render_text())
         report = ep.to_dict()
@@ -125,7 +124,7 @@ class EnergyProfiler:
 
     def __init__(
         self,
-        socket_path: str = DEFAULT_SOCKET_PATH,
+        socket_path: str | None = None,
         interval_ms: int = 10,
         profiler_interval_s: float = 0.001,
     ):
