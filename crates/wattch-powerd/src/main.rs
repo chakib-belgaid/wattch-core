@@ -69,19 +69,18 @@ fn main() -> Result<()> {
         explicit => explicit,
     };
 
-    // Probe once so misconfiguration fails at startup, not per connection.
+    // Scan the powercap tree once so misconfiguration fails at startup, not
+    // per connection, and so every connection shares the same probed zone
+    // list (`RaplBackend` is a cheap `Clone` of already-read data) instead
+    // of re-scanning powercap on each new connection. If the powercap tree
+    // disappears later (module unload, permission change), that surfaces as
+    // per-sample read errors on the existing skip-with-warn path in
+    // `RaplBackend::sample`, not a re-scan and not a panic.
     let make_backend: Box<dyn Fn() -> Box<dyn SampleBackend> + Send + Sync> = match backend {
         BackendChoice::LinuxRapl => {
-            RaplBackend::new(&args.powercap_root, &args.node_id)
+            let probed = RaplBackend::new(&args.powercap_root, &args.node_id)
                 .context("linux-rapl backend unavailable")?;
-            let root = args.powercap_root.clone();
-            let node_id = args.node_id.clone();
-            Box::new(move || {
-                Box::new(
-                    RaplBackend::new(&root, &node_id)
-                        .expect("powercap tree disappeared after startup probe"),
-                )
-            })
+            Box::new(move || Box::new(probed.clone()))
         }
         BackendChoice::Synthetic => {
             let node_id = args.node_id.clone();
