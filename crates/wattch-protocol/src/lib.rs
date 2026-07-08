@@ -8,6 +8,7 @@
 
 pub mod frame;
 pub mod messages;
+pub mod socket;
 
 pub const PROTOCOL_NAME: &str = "wattch";
 pub const PROTOCOL_VERSION: &str = "0.1.0";
