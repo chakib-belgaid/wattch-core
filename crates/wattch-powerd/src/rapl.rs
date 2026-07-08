@@ -233,7 +233,16 @@ impl SampleBackend for RaplBackend {
         self.energy_files
             .iter()
             .filter_map(|(source_id, path)| match read_u64(path) {
-                Ok(value) => Some((*source_id, RawValue::I64(value as i64))),
+                Ok(value) => match i64::try_from(value) {
+                    Ok(value) => Some((*source_id, RawValue::I64(value))),
+                    Err(_) => {
+                        warn!(
+                            source_id,
+                            value, "skipping RAPL counter that exceeds the i64 sample range"
+                        );
+                        None
+                    }
+                },
                 Err(err) => {
                     warn!(source_id, error = %err, "skipping unreadable RAPL zone");
                     None
@@ -349,6 +358,22 @@ mod tests {
         let root = fake_tree("skip");
         let mut backend = RaplBackend::new(&root, "node-x").unwrap();
         fs::write(root.join("intel-rapl:0/energy_uj"), "garbage\n").unwrap();
+        let readings = backend.sample();
+        assert_eq!(readings.len(), 3);
+        assert!(!readings.iter().any(|(id, _)| *id == 1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn out_of_range_counter_is_skipped_not_wrapped() {
+        let root = fake_tree("overflow");
+        let mut backend = RaplBackend::new(&root, "node-x").unwrap();
+        fs::write(
+            root.join("intel-rapl:0/energy_uj"),
+            format!("{}\n", u64::MAX),
+        )
+        .unwrap();
         let readings = backend.sample();
         assert_eq!(readings.len(), 3);
         assert!(!readings.iter().any(|(id, _)| *id == 1));

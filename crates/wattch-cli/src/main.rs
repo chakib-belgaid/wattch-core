@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wattch_cli::artifact::{inspect_run, RunWriter};
 use wattch_cli::client::WattchClient;
-use wattch_core::{validate_source_set, RunManifest, SourceDescriptor};
+use wattch_core::{validate_batch, validate_source_set, RunManifest, SourceDescriptor};
 use wattch_protocol::PROTOCOL_VERSION;
 
 #[derive(Debug, Parser)]
@@ -98,6 +98,8 @@ fn main() -> Result<()> {
             let run_id = run_id.unwrap_or_else(generated_run_id);
             let mut client = WattchClient::connect(&socket)?;
             let hello = client.hello().clone();
+            validate_source_set(&hello.sources)
+                .context("daemon advertised an invalid source set")?;
 
             let manifest = RunManifest {
                 run_id: run_id.clone(),
@@ -113,21 +115,25 @@ fn main() -> Result<()> {
             };
 
             let mut writer = RunWriter::create(&out, &manifest)?;
-            let mut write_error = None;
+            let mut capture_error: Option<anyhow::Error> = None;
             let ack = client.capture(
                 &run_id,
                 interval_ms,
                 Duration::from_millis(duration_ms),
                 |batch| {
-                    if write_error.is_none() {
-                        if let Err(err) = writer.append_batch(&batch) {
-                            write_error = Some(err);
-                        }
+                    if capture_error.is_some() {
+                        return;
+                    }
+                    if let Err(err) = validate_batch(&batch, &hello.sources) {
+                        capture_error =
+                            Some(anyhow::Error::new(err).context("daemon sent an invalid batch"));
+                    } else if let Err(err) = writer.append_batch(&batch) {
+                        capture_error = Some(err.into());
                     }
                 },
             )?;
-            if let Some(err) = write_error {
-                return Err(err.into());
+            if let Some(err) = capture_error {
+                return Err(err);
             }
             let run_dir = writer.finish()?;
 
