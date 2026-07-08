@@ -22,6 +22,9 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/chakib-belgaid/wattch-core"
 
+[project.scripts]
+wattch-energytest = "pywattch.energytest.__main__:main"
+
 [project.optional-dependencies]
 profiler = ["pyinstrument>=4.6"]
 dev = ["pytest>=8", "pyinstrument>=4.6"]
