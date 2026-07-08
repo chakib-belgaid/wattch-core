@@ -1,6 +1,11 @@
 import pytest
 
-from pywattch import WattchClient, WattchConnectionError, WattchDaemonError, WattchProtocolError
+from pywattch import (
+    WattchClient,
+    WattchConnectionError,
+    WattchDaemonError,
+    WattchProtocolError,
+)
 from pywattch import client as client_module
 from pywattch._messages import StartCaptureAck
 
