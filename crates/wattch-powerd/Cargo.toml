@@ -1,11 +1,12 @@
 [package]
 name = "wattch-powerd"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Privileged energy acquisition daemon (Intel RAPL via powercap, synthetic fallback)"
 
 [[bin]]
 name = "wattch-powerd"

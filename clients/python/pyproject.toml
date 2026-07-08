@@ -11,6 +11,16 @@ requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Mohammed Chakib Belgaid" }]
 keywords = ["energy", "rapl", "power", "profiling", "wattch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/chakib-belgaid/wattch-core"
 
 [project.optional-dependencies]
 profiler = ["pyinstrument>=4.6"]
