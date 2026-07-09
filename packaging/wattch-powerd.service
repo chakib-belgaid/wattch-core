@@ -1,12 +1,18 @@
 [Unit]
 Description=Wattch powermeter daemon (privileged RAPL acquisition)
 Documentation=https://github.com/chakib-belgaid/wattch-core
-After=local-fs.target
+After=local-fs.target wattch-powerd.socket
+Requires=wattch-powerd.socket
 
 [Service]
 Type=simple
+# No --socket flag: with wattch-powerd.socket active, systemd passes the
+# pre-bound socket via LISTEN_FDS and the daemon serves on it (path, mode,
+# and ownership live in the .socket unit). Passing --socket alongside an
+# activated fd is a startup error. Without the socket unit (self-bind
+# fallback), the daemon binds /run/wattch/wattch-powerd.sock itself when
+# running as root — same path, imperative mode.
 ExecStart=/usr/local/bin/wattch-powerd \
-  --socket /run/wattch/wattch-powerd.sock \
   --backend linux-rapl \
   --node-id %H
 RuntimeDirectory=wattch
@@ -19,25 +25,17 @@ User=root
 # --- Access model -----------------------------------------------------------
 # Fine-grained RAPL energy counters are a documented side channel (PLATYPUS,
 # CVE-2020-8694), which is why modern kernels restrict energy_uj to root.
-# wattch-powerd re-exposes those counters over this socket, so the socket
-# itself -- not the powercap files -- is now the security boundary:
-#   - RuntimeDirectory=wattch is created by systemd as /run/wattch, mode 0750,
-#     owned by root:root (root:<group> if this unit adds a `Group=` -- see
-#     option 1 below). No other local user can even traverse into it.
-#   - wattch-powerd itself chmods the socket file to 0660 after bind(), so it
-#     is root-writable and (root's primary group)-readable/writable, not
-#     world-accessible.
-# To grant a non-root group read access to live measurements, pick one:
-#   1. Group=wattch-readers                (systemd runs the daemon with this
-#                                            group; the socket inherits it,
-#                                            so members of wattch-readers can
-#                                            connect)
-#   2. A drop-in unit with:
-#        ExecStartPost=/usr/bin/chgrp wattch-readers /run/wattch/wattch-powerd.sock
-#      (racier than Group=; only use if the daemon can't run under the
-#      target group directly)
-#   3. Run clients as root / via sudo -- simplest, no group management, but
-#      loses the least-privilege split between acquisition and consumption.
+# wattch-powerd re-exposes those counters over this socket. Two layers gate
+# access:
+#   1. File permissions: /run/wattch is 0750 and the socket 0660, both set
+#      declaratively in wattch-powerd.socket (SocketMode=/SocketGroup=) under
+#      socket activation, or imperatively by the daemon when self-binding.
+#      Grant a trusted group via SocketGroup= in the .socket unit.
+#   2. Kernel-verified peer credentials (SO_PEERCRED), checked at accept()
+#      time: by default only uid 0 and the daemon's own uid may connect.
+#      Broaden with repeatable --allow-uid/--allow-gid flags on ExecStart.
+#      Note --allow-gid matches the peer's EFFECTIVE gid only; supplementary
+#      group membership is only honored by layer 1's file permissions.
 # -----------------------------------------------------------------------------
 Restart=on-failure
 RestartSec=2

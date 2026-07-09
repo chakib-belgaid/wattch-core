@@ -1,0 +1,20 @@
+[Unit]
+Description=Wattch powermeter daemon socket
+Documentation=https://github.com/chakib-belgaid/wattch-core
+
+[Socket]
+ListenStream=/run/wattch/wattch-powerd.sock
+# The socket file is the security boundary for RAPL side-channel data
+# (PLATYPUS, CVE-2020-8694): group access only, never world-open.
+SocketMode=0660
+SocketUser=root
+# To grant a group of trusted local users access to live measurements,
+# create the group (e.g. `groupadd --system wattch`) or change the name,
+# then uncomment. File permissions honor supplementary group membership,
+# unlike the daemon's --allow-gid flag (effective gid only).
+#SocketGroup=wattch
+DirectoryMode=0750
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
