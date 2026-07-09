@@ -7,7 +7,9 @@ use wattch_core::{
     EvidenceClass, RawValue, RunManifest, SamplingMode, SourceDescriptor, SourceKind, Temporality,
     Unit,
 };
-use wattch_daemon::{DaemonIdentity, SampleBackend, ServerConfig, ServerHandle};
+use wattch_daemon::{
+    DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, ServerHandle, SocketSource,
+};
 
 struct RampBackend {
     descriptors: Vec<SourceDescriptor>,
@@ -54,12 +56,13 @@ fn start_server(name: &str) -> (ServerHandle, PathBuf) {
     let _ = std::fs::remove_file(&socket_path);
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path: socket_path.clone(),
+            socket: SocketSource::Bind(socket_path.clone()),
             identity: DaemonIdentity {
                 daemon_name: "ramp-daemon".to_string(),
                 daemon_version: "test".to_string(),
                 node_id: "node-cli".to_string(),
             },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         || {
             Box::new(RampBackend {

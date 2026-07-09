@@ -1,4 +1,5 @@
 use crate::backend::SampleBackend;
+use crate::peer::PeerPolicy;
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
@@ -26,10 +27,24 @@ pub struct DaemonIdentity {
     pub node_id: String,
 }
 
-#[derive(Clone, Debug)]
+/// Where the listening socket comes from.
+#[derive(Debug)]
+pub enum SocketSource {
+    /// Bind `path` ourselves: create the parent directory (0750), clean a
+    /// stale socket, bind, chmod 0660, and unlink on shutdown.
+    Bind(PathBuf),
+    /// Serve on a listener bound by someone else (systemd socket
+    /// activation). Mode, ownership, and lifecycle of the socket file
+    /// belong to the activator: no chmod, no unlink on shutdown.
+    Activated(UnixListener),
+}
+
+/// Not `Clone`: `SocketSource::Activated` holds a `UnixListener`.
+#[derive(Debug)]
 pub struct ServerConfig {
-    pub socket_path: PathBuf,
+    pub socket: SocketSource,
     pub identity: DaemonIdentity,
+    pub peer_policy: PeerPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +60,9 @@ pub enum ServerError {
 /// call [`ServerHandle::shutdown`].
 pub struct ServerHandle {
     socket_path: PathBuf,
+    /// True when we bound the socket ourselves (`SocketSource::Bind`) and
+    /// therefore own the socket file's lifecycle.
+    owns_socket_file: bool,
     stop: Arc<AtomicBool>,
     accept_thread: thread::JoinHandle<()>,
 }
@@ -61,13 +79,17 @@ impl ServerHandle {
         // Wake the blocking accept() with a throwaway connection.
         let _ = UnixStream::connect(&self.socket_path);
         let _ = self.accept_thread.join();
-        let _ = std::fs::remove_file(&self.socket_path);
+        if self.owns_socket_file {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 
     /// Block until the server is shut down externally (for daemon mains).
     pub fn wait(self) {
         let _ = self.accept_thread.join();
-        let _ = std::fs::remove_file(&self.socket_path);
+        if self.owns_socket_file {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -81,37 +103,57 @@ where
     validate_source_set(probe.descriptors())?;
     drop(probe);
 
-    ensure_socket_parent_dir(&config.socket_path)?;
+    let (listener, socket_path, owns_socket_file) = match config.socket {
+        SocketSource::Bind(path) => {
+            ensure_socket_parent_dir(&path)?;
 
-    if config.socket_path.exists() {
-        // A previous daemon may have crashed without unlinking its socket.
-        // If nothing accepts connections there, the socket is stale.
-        if UnixStream::connect(&config.socket_path).is_ok() {
-            return Err(ServerError::Io(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!(
-                    "another daemon is already listening on {}",
-                    config.socket_path.display()
-                ),
-            )));
+            if path.exists() {
+                // A previous daemon may have crashed without unlinking its
+                // socket. If nothing accepts connections there, the socket
+                // is stale.
+                if UnixStream::connect(&path).is_ok() {
+                    return Err(ServerError::Io(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("another daemon is already listening on {}", path.display()),
+                    )));
+                }
+                warn!(path = %path.display(), "removing stale socket");
+                std::fs::remove_file(&path)?;
+            }
+
+            let listener = UnixListener::bind(&path)?;
+            // energy_uj-derived samples are a documented side channel
+            // (PLATYPUS, CVE-2020-8694); the socket must not be group/world
+            // writable, and the owned parent directory (mode 0750, set
+            // above) is the TOCTOU mitigation for the stale-socket probe
+            // above.
+            fs::set_permissions(&path, Permissions::from_mode(0o660))?;
+            (listener, path, true)
         }
-        warn!(path = %config.socket_path.display(), "removing stale socket");
-        std::fs::remove_file(&config.socket_path)?;
-    }
-
-    let listener = UnixListener::bind(&config.socket_path)?;
-    // energy_uj-derived samples are a documented side channel (PLATYPUS,
-    // CVE-2020-8694); the socket must not be group/world writable, and the
-    // owned parent directory (mode 0750, set above) is the TOCTOU mitigation
-    // for the stale-socket probe below.
-    fs::set_permissions(&config.socket_path, Permissions::from_mode(0o660))?;
-    info!(path = %config.socket_path.display(), "listening");
+        SocketSource::Activated(listener) => {
+            // systemd owns the socket file: its mode/ownership come from
+            // the .socket unit and it is removed by RemoveOnStop=, so no
+            // chmod and no unlink here. The path is still needed for the
+            // shutdown wake-up connect and for logging.
+            let addr = listener.local_addr()?;
+            let Some(path) = addr.as_pathname() else {
+                return Err(ServerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "activated listener has no filesystem path \
+                     (unnamed/abstract sockets are unsupported)",
+                )));
+            };
+            let path = path.to_path_buf();
+            (listener, path, false)
+        }
+    };
+    info!(path = %socket_path.display(), "listening");
 
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
-    let socket_path = config.socket_path.clone();
     let identity = config.identity;
     let factory = Arc::new(factory);
+    let _peer_policy = config.peer_policy;
 
     let accept_thread = thread::spawn(move || {
         for connection in listener.incoming() {
@@ -137,6 +179,7 @@ where
 
     Ok(ServerHandle {
         socket_path,
+        owns_socket_file,
         stop,
         accept_thread,
     })
@@ -580,8 +623,9 @@ mod permission_tests {
 
         let handle = spawn(
             ServerConfig {
-                socket_path: socket_path.clone(),
+                socket: SocketSource::Bind(socket_path.clone()),
                 identity: identity(),
+                peer_policy: PeerPolicy::with_grants(&[], &[]),
             },
             || Box::new(NoopBackend::new()),
         )
@@ -610,8 +654,9 @@ mod permission_tests {
 
         let result = spawn(
             ServerConfig {
-                socket_path,
+                socket: SocketSource::Bind(socket_path),
                 identity: identity(),
+                peer_policy: PeerPolicy::with_grants(&[], &[]),
             },
             || Box::new(NoopBackend::new()),
         );

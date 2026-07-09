@@ -1,7 +1,7 @@
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use wattch_core::RawValue;
-use wattch_daemon::{DaemonIdentity, SampleBackend, ServerConfig};
+use wattch_daemon::{DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, SocketSource};
 use wattch_protocol::messages::{
     read_message, write_message, HelloRequest, Message, StartCapture, StopCapture,
 };
@@ -38,12 +38,13 @@ fn serves_example_scenario_over_socket() {
 
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path: socket_path.clone(),
+            socket: SocketSource::Bind(socket_path.clone()),
             identity: DaemonIdentity {
                 daemon_name: "wattch-testd".to_string(),
                 daemon_version: "test".to_string(),
                 node_id,
             },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
     )

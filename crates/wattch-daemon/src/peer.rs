@@ -53,9 +53,8 @@ impl PeerPolicy {
 /// denial, never as an allow.
 #[cfg(target_os = "linux")]
 pub fn peer_credentials(stream: &UnixStream) -> io::Result<Option<PeerCreds>> {
-    let creds =
-        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
-            .map_err(io::Error::from)?;
+    let creds = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(io::Error::from)?;
     Ok(Some(PeerCreds {
         uid: creds.uid(),
         gid: creds.gid(),

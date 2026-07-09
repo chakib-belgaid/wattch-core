@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use wattch_core::validate_source_set;
-use wattch_daemon::{DaemonIdentity, ServerConfig};
+use wattch_daemon::{DaemonIdentity, PeerPolicy, ServerConfig, SocketSource};
 use wattch_testd::scenario::{generate_batches, load_scenario, DeterministicBackend};
 
 #[derive(Debug, Parser)]
@@ -59,8 +59,9 @@ fn main() -> Result<()> {
 
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path,
+            socket: SocketSource::Bind(socket_path),
             identity,
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
     )

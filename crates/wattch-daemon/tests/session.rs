@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use wattch_core::{
     EvidenceClass, RawValue, SamplingMode, SourceDescriptor, SourceKind, Temporality, Unit,
 };
-use wattch_daemon::{spawn, DaemonIdentity, SampleBackend, ServerConfig, ServerHandle};
+use wattch_daemon::{
+    spawn, DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, ServerHandle, SocketSource,
+};
 use wattch_protocol::frame::{write_frame, FrameKind};
 use wattch_protocol::messages::{
     error_codes, read_message, write_message, HelloRequest, Message, StartCapture, StopCapture,
@@ -74,12 +76,13 @@ fn start_server(name: &str) -> (ServerHandle, PathBuf) {
     let _ = std::fs::remove_file(&socket_path);
     let handle = spawn(
         ServerConfig {
-            socket_path: socket_path.clone(),
+            socket: SocketSource::Bind(socket_path.clone()),
             identity: DaemonIdentity {
                 daemon_name: "wattch-daemon-test".to_string(),
                 daemon_version: "0.0.0".to_string(),
                 node_id: "node-test".to_string(),
             },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         || Box::new(CountingBackend::new()),
     )
@@ -346,12 +349,13 @@ fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
     let factory_panicked = Arc::clone(&panicked);
     let handle = spawn(
         ServerConfig {
-            socket_path: socket_path.clone(),
+            socket: SocketSource::Bind(socket_path.clone()),
             identity: DaemonIdentity {
                 daemon_name: "wattch-daemon-test".to_string(),
                 daemon_version: "0.0.0".to_string(),
                 node_id: "node-test".to_string(),
             },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         move || {
             Box::new(FlakyBackend {
@@ -445,4 +449,47 @@ fn incompatible_protocol_version_is_rejected() {
     }
 
     handle.shutdown();
+}
+
+/// SocketSource::Activated covers the systemd-socket-activation serving
+/// path on every platform: the test plays the role of systemd by binding
+/// the listener itself. The server must serve sessions on it and must NOT
+/// unlink the socket file on shutdown — the activator owns its lifecycle.
+#[test]
+fn activated_listener_serves_and_socket_survives_shutdown() {
+    let socket_path = std::env::temp_dir().join(format!(
+        "wattch-daemon-test-activated-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+    let handle = spawn(
+        ServerConfig {
+            socket: SocketSource::Activated(listener),
+            identity: DaemonIdentity {
+                daemon_name: "wattch-daemon-test".to_string(),
+                daemon_version: "0.0.0".to_string(),
+                node_id: "node-test".to_string(),
+            },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
+        },
+        || Box::new(CountingBackend::new()),
+    )
+    .expect("server should serve a pre-bound listener");
+    assert_eq!(handle.socket_path(), socket_path.as_path());
+
+    let mut stream = UnixStream::connect(&socket_path).unwrap();
+    match hello(&mut stream) {
+        Message::HelloResponse(response) => assert_eq!(response.node_id, "node-test"),
+        other => panic!("expected HelloResponse, got {other:?}"),
+    }
+    drop(stream);
+
+    handle.shutdown();
+    assert!(
+        socket_path.exists(),
+        "activated sockets belong to the activator; shutdown must not unlink"
+    );
+    let _ = std::fs::remove_file(&socket_path);
 }

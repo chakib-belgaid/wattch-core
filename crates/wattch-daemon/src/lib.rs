@@ -11,4 +11,4 @@ pub mod server;
 
 pub use backend::SampleBackend;
 pub use peer::{PeerCreds, PeerPolicy};
-pub use server::{spawn, DaemonIdentity, ServerConfig, ServerError, ServerHandle};
+pub use server::{spawn, DaemonIdentity, ServerConfig, ServerError, ServerHandle, SocketSource};

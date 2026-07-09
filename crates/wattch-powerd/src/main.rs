@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
-use wattch_daemon::{DaemonIdentity, SampleBackend, ServerConfig};
+use wattch_daemon::{DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, SocketSource};
 use wattch_powerd::rapl::RaplBackend;
 use wattch_powerd::synthetic::SyntheticBackend;
 
@@ -96,12 +96,13 @@ fn main() -> Result<()> {
 
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket_path,
+            socket: SocketSource::Bind(socket_path),
             identity: DaemonIdentity {
                 daemon_name: "wattch-powerd".to_string(),
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 node_id: args.node_id.clone(),
             },
+            peer_policy: PeerPolicy::with_grants(&[], &[]),
         },
         move || make_backend(),
     )
