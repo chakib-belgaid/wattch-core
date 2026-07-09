@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Shared Unix-socket serving runtime for wattch daemons"
 
 [dependencies]
+nix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wattch-core.workspace = true

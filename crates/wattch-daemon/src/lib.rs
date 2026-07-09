@@ -6,7 +6,9 @@
 //! no way to aggregate, derive, or interpret.
 
 pub mod backend;
+pub mod peer;
 pub mod server;
 
 pub use backend::SampleBackend;
+pub use peer::{PeerCreds, PeerPolicy};
 pub use server::{spawn, DaemonIdentity, ServerConfig, ServerError, ServerHandle};
