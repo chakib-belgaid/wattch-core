@@ -27,27 +27,52 @@ usable powercap tree exists, otherwise falls back to `synthetic` with a
 warning. `--powercap-root` overrides the sysfs root (used by tests; also
 useful in containers that bind-mount powercap somewhere else).
 
-## Running
+## Socket path
+
+`--socket` overrides everything below and behaves exactly as before. When
+omitted, `wattch-powerd`, `wattch-testd`, `wattch` (the CLI), and `pywattch`
+all resolve the same default, in priority order:
+
+```text
+1. /run/wattch/<name>                      when running as root (or, for
+                                            clients, whenever this path
+                                            exists -- e.g. under systemd's
+                                            RuntimeDirectory=wattch)
+2. $XDG_RUNTIME_DIR/wattch/<name>          user-private runtime directory
+3. /tmp/<stem>-<uid>.sock                  per-uid fallback, e.g.
+                                            /tmp/wattch-powerd-501.sock
+```
+
+`<name>` is `wattch-powerd.sock` for the powermeter daemon and
+`wattch-testd.sock` for the deterministic test daemon. A client (`wattch`,
+`pywattch`) probes the same three paths in order and connects to the first
+one that exists; if none exist, it fails with an error listing every path it
+tried.
 
 ```bash
-# Development (any OS):
-wattch-powerd --backend synthetic --socket /tmp/wattch-powerd.sock
+# Development (any OS): binds under $XDG_RUNTIME_DIR or a per-uid /tmp path.
+wattch-powerd --backend synthetic
 
-# Linux with RAPL (typically as root, or with read access to powercap):
-sudo wattch-powerd --backend linux-rapl --socket /run/wattch/wattch-powerd.sock
+# Linux with RAPL, running as root: binds /run/wattch/wattch-powerd.sock.
+sudo wattch-powerd --backend linux-rapl
+
+# Explicit path always wins, on either side:
+wattch-powerd --backend synthetic --socket /tmp/wattch-powerd.sock
 ```
 
 Check it from the unprivileged side:
 
 ```bash
-wattch sources --socket /tmp/wattch-powerd.sock
-wattch capture --socket /tmp/wattch-powerd.sock --out runs --duration-ms 2000
+wattch sources     # auto-detects the socket above
+wattch capture --out runs --duration-ms 2000
 ```
 
 ## Privilege model
 
 Since Linux 5.10, `energy_uj` under powercap is root-readable only
-(side-channel mitigation). The supported deployment is:
+(side-channel mitigation): fine-grained RAPL energy counters are a
+documented side channel (PLATYPUS, CVE-2020-8694). The supported deployment
+is:
 
 ```text
 wattch-powerd runs with the privilege required to read powercap
@@ -55,9 +80,20 @@ the socket is the boundary: make it readable by the users who may measure
 clients never read RAPL files directly
 ```
 
-The socket inherits default permissions from its directory. For a shared
-machine, place the socket in a directory owned by a `wattch` group (e.g.
-`/run/wattch`, mode 0750) instead of widening file permissions.
+The socket is not left to inherited/default permissions:
+
+- The daemon creates its socket's parent directory itself (if missing) with
+  mode **0750** -- only the immediate directory, not an arbitrary ancestor
+  chain; it errors out if the grandparent is also missing rather than
+  silently creating one.
+- After binding, the daemon explicitly `chmod`s the socket file to **0660**
+  (root-writable, group-readable/writable, no world access).
+
+For a shared machine under systemd, `RuntimeDirectory=wattch` (see
+`packaging/wattch-powerd.service`) gives `/run/wattch` mode 0750 owned by
+root; grant a group of trusted local users access via `Group=` on the unit
+(or `chgrp` the socket in an `ExecStartPost`) rather than widening the
+socket's own permissions.
 
 ## systemd
 

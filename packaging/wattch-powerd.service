@@ -10,11 +10,35 @@ ExecStart=/usr/local/bin/wattch-powerd \
   --backend linux-rapl \
   --node-id %H
 RuntimeDirectory=wattch
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 # The daemon only needs read access to /sys/class/powercap. Running as a
 # dedicated user with the powercap files made group-readable is preferred;
 # running as root works out of the box.
 User=root
+
+# --- Access model -----------------------------------------------------------
+# Fine-grained RAPL energy counters are a documented side channel (PLATYPUS,
+# CVE-2020-8694), which is why modern kernels restrict energy_uj to root.
+# wattch-powerd re-exposes those counters over this socket, so the socket
+# itself -- not the powercap files -- is now the security boundary:
+#   - RuntimeDirectory=wattch is created by systemd as /run/wattch, mode 0750,
+#     owned by root:root (root:<group> if this unit adds a `Group=` -- see
+#     option 1 below). No other local user can even traverse into it.
+#   - wattch-powerd itself chmods the socket file to 0660 after bind(), so it
+#     is root-writable and (root's primary group)-readable/writable, not
+#     world-accessible.
+# To grant a non-root group read access to live measurements, pick one:
+#   1. Group=wattch-readers                (systemd runs the daemon with this
+#                                            group; the socket inherits it,
+#                                            so members of wattch-readers can
+#                                            connect)
+#   2. A drop-in unit with:
+#        ExecStartPost=/usr/bin/chgrp wattch-readers /run/wattch/wattch-powerd.sock
+#      (racier than Group=; only use if the daemon can't run under the
+#      target group directly)
+#   3. Run clients as root / via sudo -- simplest, no group management, but
+#      loses the least-privilege split between acquisition and consumption.
+# -----------------------------------------------------------------------------
 Restart=on-failure
 RestartSec=2
 

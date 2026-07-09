@@ -151,10 +151,10 @@ Daemon + CLI:
 cargo build --workspace
 
 # powermeter daemon (auto picks linux-rapl when available, else synthetic)
-./target/debug/wattch-powerd --socket /tmp/wattch-powerd.sock &
+./target/debug/wattch-powerd &
 
-./target/debug/wattch sources --socket /tmp/wattch-powerd.sock
-./target/debug/wattch capture --socket /tmp/wattch-powerd.sock --out runs --duration-ms 2000
+./target/debug/wattch sources
+./target/debug/wattch capture --out runs --duration-ms 2000
 ./target/debug/wattch inspect --run runs/<run-id>
 ```
 
@@ -167,7 +167,7 @@ cd clients/python && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,pr
 ```python
 from pywattch import EnergyMeter
 
-with EnergyMeter(socket_path="/tmp/wattch-powerd.sock") as meter:
+with EnergyMeter() as meter:
     workload()
 print(meter.get_trace().total_joules)
 ```
@@ -175,14 +175,13 @@ print(meter.get_trace().total_joules)
 Energy tests (and the VSCode "Energy Tests" extension on top of them):
 
 ```bash
-python -m pywattch.energytest run --root examples/energy-tests \
-    --socket /tmp/wattch-powerd.sock --json
+python -m pywattch.energytest run --root examples/energy-tests --json
 ```
 
 Deterministic daemon for protocol work and golden tests:
 
 ```bash
-cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested.json --socket /tmp/wattch-testd.sock
+cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested.json
 ```
 
 Verification gate:
@@ -192,6 +191,10 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 clients/python/.venv/bin/python -m pytest clients/python/tests
 cd editors/vscode-energy-tests && npm run build && npm test
 ```
+
+### Development
+
+Run `just --list` to see the available recipes (`build`, `test`, `test-rust`, `test-python`, `test-ext`, `lint`, `fmt`) — they wrap the commands above. CI runs `cargo fmt`, `cargo clippy`, and the Rust/Python/extension test suites on every push to `main` and every pull request.
 
 ## Layering
 
@@ -209,4 +212,9 @@ Future HWPC Sensor integration remains out of scope. It may later become a socke
 
 ## License
 
-TBD.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.

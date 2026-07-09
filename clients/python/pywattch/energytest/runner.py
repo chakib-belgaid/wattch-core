@@ -6,7 +6,6 @@ import statistics
 import traceback
 from dataclasses import dataclass, field
 
-from ..client import DEFAULT_SOCKET_PATH
 from ..meter import EnergyMeter
 from .discovery import DiscoveredTest
 
@@ -71,7 +70,7 @@ def _median_run(runs: list[RunMeasurement]) -> RunMeasurement:
 
 def run_one(
     test: DiscoveredTest,
-    socket_path: str = DEFAULT_SOCKET_PATH,
+    socket_path: str | None = None,
     interval_ms: int = 10,
     repeat_override: int | None = None,
 ) -> TestResult:
@@ -143,7 +142,7 @@ def run_one(
 
 def run_tests(
     tests: list[DiscoveredTest],
-    socket_path: str = DEFAULT_SOCKET_PATH,
+    socket_path: str | None = None,
     interval_ms: int = 10,
     repeat_override: int | None = None,
 ) -> list[TestResult]:

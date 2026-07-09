@@ -155,7 +155,12 @@ fn source_path_for(zone: &Zone, parent: Option<&Zone>) -> String {
 }
 
 /// RAPL backend: one source per powercap zone, cumulative microjoules.
-#[derive(Debug)]
+///
+/// Cheaply `Clone`: both fields are plain `Vec`s of already-probed data, no
+/// open file handles or filesystem state. This lets callers scan the
+/// powercap tree once (e.g. at startup) and hand every connection its own
+/// clone instead of re-scanning per connection.
+#[derive(Clone, Debug)]
 pub struct RaplBackend {
     descriptors: Vec<SourceDescriptor>,
     energy_files: Vec<(u32, PathBuf)>,
@@ -233,7 +238,16 @@ impl SampleBackend for RaplBackend {
         self.energy_files
             .iter()
             .filter_map(|(source_id, path)| match read_u64(path) {
-                Ok(value) => Some((*source_id, RawValue::I64(value as i64))),
+                Ok(value) => match i64::try_from(value) {
+                    Ok(value) => Some((*source_id, RawValue::I64(value))),
+                    Err(_) => {
+                        warn!(
+                            source_id,
+                            value, "skipping RAPL counter that exceeds the i64 sample range"
+                        );
+                        None
+                    }
+                },
                 Err(err) => {
                     warn!(source_id, error = %err, "skipping unreadable RAPL zone");
                     None
@@ -354,6 +368,49 @@ mod tests {
         assert!(!readings.iter().any(|(id, _)| *id == 1));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn out_of_range_counter_is_skipped_not_wrapped() {
+        let root = fake_tree("overflow");
+        let mut backend = RaplBackend::new(&root, "node-x").unwrap();
+        fs::write(
+            root.join("intel-rapl:0/energy_uj"),
+            format!("{}\n", u64::MAX),
+        )
+        .unwrap();
+        let readings = backend.sample();
+        assert_eq!(readings.len(), 3);
+        assert!(!readings.iter().any(|(id, _)| *id == 1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloned_backend_keeps_sampling_after_root_removed() {
+        // Exercises the option (b) design from the powerd factory fix: a
+        // backend probed once at startup is cloned per connection instead
+        // of re-scanning the powercap tree. If the tree disappears at
+        // runtime, a clone made *before* the disappearance must still
+        // sample without panicking (unreadable zones are skipped, per
+        // `SampleBackend::sample`'s documented behavior) rather than
+        // requiring a fresh, now-failing `RaplBackend::new` rescan.
+        let root = fake_tree("clone-removed");
+        let backend = RaplBackend::new(&root, "node-x").unwrap();
+        let mut cloned = backend.clone();
+
+        fs::remove_dir_all(&root).unwrap();
+
+        let readings = cloned.sample();
+        assert!(
+            readings.is_empty(),
+            "every zone file is gone; all reads should be skipped, not panic"
+        );
+        assert_eq!(
+            cloned.descriptors().len(),
+            4,
+            "descriptors survive independent of disk"
+        );
     }
 
     #[test]

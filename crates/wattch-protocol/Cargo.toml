@@ -1,13 +1,15 @@
 [package]
 name = "wattch-protocol"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+description = "Wire format (v0.1 frames and messages) for wattch daemons and clients"
 
 [dependencies]
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use wattch_cli::artifact::{inspect_run, read_manifest, ArtifactError, RunWriter};
+use wattch_cli::artifact::{inspect_run, read_manifest, replay_trace, ArtifactError, RunWriter};
 use wattch_cli::client::WattchClient;
 use wattch_core::{
     EvidenceClass, RawValue, RunManifest, SamplingMode, SourceDescriptor, SourceKind, Temporality,
@@ -150,6 +150,40 @@ fn run_writer_refuses_to_overwrite_existing_run() {
         RunWriter::create(&out_root, &manifest),
         Err(ArtifactError::AlreadyExists(_))
     ));
+    let _ = std::fs::remove_dir_all(out_root);
+}
+
+#[test]
+fn replay_and_inspect_on_truncated_trace_return_clean_errors_not_panics() {
+    let out_root = temp_out("truncated-trace");
+    let manifest = RunManifest {
+        run_id: "run-truncated".to_string(),
+        node_id: "n".to_string(),
+        protocol_version: "0.1.0".to_string(),
+        wattch_version: "test".to_string(),
+        created_unix_ns: 1,
+        sources: vec![descriptor(1, "cpu/package/0/energy")],
+        labels: BTreeMap::new(),
+    };
+    let writer = RunWriter::create(&out_root, &manifest).unwrap();
+    let run_dir = writer.finish().unwrap();
+
+    // Simulate a crash mid-write: a handful of bytes that can't possibly be
+    // a complete frame header, let alone a full frame.
+    std::fs::write(run_dir.join("raw.trace.wch"), [0xAB, 0xCD, 0xEF]).unwrap();
+
+    let err = replay_trace(&run_dir, |_| {}).unwrap_err();
+    assert!(
+        matches!(err, ArtifactError::Trace { .. }),
+        "expected a clean ArtifactError::Trace, got {err:?}"
+    );
+
+    let err = inspect_run(&run_dir).unwrap_err();
+    assert!(
+        matches!(err, ArtifactError::Trace { .. }),
+        "expected inspect_run to surface the same clean error, got {err:?}"
+    );
+
     let _ = std::fs::remove_dir_all(out_root);
 }
 

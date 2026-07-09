@@ -51,8 +51,7 @@ cargo run -p wattch-testd -- --scenario examples/scenarios/laptop_cpu_gpu_nested
 
 # tests
 python -m pywattch.energytest discover --root examples/energy-tests
-python -m pywattch.energytest run --root examples/energy-tests \
-    --socket /tmp/wattch-powerd.sock --json
+python -m pywattch.energytest run --root examples/energy-tests --json
 ```
 
 The runner exits non-zero when anything failed, errored, or blew its

@@ -11,6 +11,19 @@ requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Mohammed Chakib Belgaid" }]
 keywords = ["energy", "rapl", "power", "profiling", "wattch"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/chakib-belgaid/wattch-core"
+
+[project.scripts]
+wattch-energytest = "pywattch.energytest.__main__:main"
 
 [project.optional-dependencies]
 profiler = ["pyinstrument>=4.6"]
@@ -18,6 +31,9 @@ dev = ["pytest>=8", "pyinstrument>=4.6"]
 
 [tool.setuptools.packages.find]
 include = ["pywattch*"]
+
+[tool.setuptools.package-data]
+pywattch = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
