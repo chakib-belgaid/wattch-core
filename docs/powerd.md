@@ -110,9 +110,14 @@ accept() time, before any protocol traffic:
 - **egid caveat:** `SO_PEERCRED` reports the peer's *effective* gid, not
   supplementary groups. `--allow-gid` therefore matches egid only: a user
   whose supplementary groups include `wattch` will NOT pass the gid
-  check. Group-based human access remains the job of the 0660 socket
-  file permissions (which do honor supplementary groups); `--allow-uid`
-  is the explicit-grant mechanism.
+  check. The 0660 socket file permissions and the peer-credential policy
+  are both required — file permissions alone no longer grant access;
+  they are necessary but not sufficient. Granting a group means setting
+  `SocketGroup=` (layer 1, honors supplementary groups) **and** adding a
+  peer-policy grant on `ExecStart` (layer 2): `--allow-uid <uid>` per
+  user is the reliable mechanism, since `--allow-gid <gid>` only matches
+  when the peer's effective gid is that group (e.g. it is their primary
+  group, or they ran `newgrp`).
 - **Non-Linux builds** (development only; RAPL is Linux-only) have no
   credential facility: the daemon allows all peers and logs a warning at
   startup. Production deployments are Linux.

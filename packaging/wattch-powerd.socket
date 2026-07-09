@@ -8,10 +8,16 @@ ListenStream=/run/wattch/wattch-powerd.sock
 # (PLATYPUS, CVE-2020-8694): group access only, never world-open.
 SocketMode=0660
 SocketUser=root
-# To grant a group of trusted local users access to live measurements,
-# create the group (e.g. `groupadd --system wattch`) or change the name,
-# then uncomment. File permissions honor supplementary group membership,
-# unlike the daemon's --allow-gid flag (effective gid only).
+# Uncommenting this grants the group file-permission access (layer 1
+# only) to the socket. The daemon also enforces a peer-credential policy
+# at accept() time (layer 2); both layers must admit a peer. Members of
+# this group additionally need a grant on the service's ExecStart:
+# --allow-uid <uid> is the reliable per-user mechanism, or --allow-gid
+# <gid> which matches only the peer's EFFECTIVE gid (not supplementary
+# groups — this file's group membership does not by itself satisfy
+# --allow-gid unless the group is the peer's primary gid or set via
+# newgrp). Create the group first (e.g. `groupadd --system wattch`) or
+# change the name, then uncomment.
 #SocketGroup=wattch
 DirectoryMode=0750
 RemoveOnStop=true

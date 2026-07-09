@@ -141,8 +141,12 @@ features are Linux-enforced and macOS builds degrade explicitly (see below).
   the group or change it), `DirectoryMode=0750`, `RemoveOnStop=true`.
 - `wattch-powerd.service` updated: `Requires=wattch-powerd.socket` +
   `After=wattch-powerd.socket`; the existing hardening block stays;
-  `RuntimeDirectory=wattch` stays (harmless under activation, useful for
-  self-bind fallback). Comments explain both deployment modes.
+  `RuntimeDirectory=wattch` stays (under `ProtectSystem=strict` it is what
+  makes `/run/wattch` writable for the self-bind fallback) but requires
+  `RuntimeDirectoryPreserve=yes` under activation: without it, a service
+  stop/restart unlinks `/run/wattch`, including the socket unit's
+  listening socket, breaking activation until the socket unit itself is
+  restarted. Comments explain both deployment modes.
 
 ### Dependencies
 
@@ -155,11 +159,13 @@ features are Linux-enforced and macOS builds degrade explicitly (see below).
 
 `SO_PEERCRED` reports the peer's *effective* gid, not supplementary groups.
 `--allow-gid` therefore matches egid only: a user whose supplementary groups
-include `wattch` will NOT pass the gid check. Group-based human access
-remains the job of the 0660 socket file permissions (which do honor
-supplementary groups); `--allow-uid` is the explicit-grant mechanism.
-`docs/powerd.md` gets a "Peer authentication" subsection stating this and
-the default policy.
+include `wattch` will NOT pass the gid check. Both layers must pass: file
+permissions (`SocketGroup=`) are necessary but not sufficient on their own,
+since the peer-credential policy is enforced independently. A group grant
+requires `SocketGroup=` in the `.socket` unit **and** a peer-policy grant on
+`ExecStart` (`--allow-uid` per user, reliably; `--allow-gid` only when the
+peer's effective gid matches). `docs/powerd.md` gets a "Peer authentication"
+subsection stating this and the default policy.
 
 ## Error handling
 
@@ -209,3 +215,23 @@ the default policy.
   macOS-native energy backend is a separate future project.
 - `sd_notify` readiness protocol (`Type=notify`) — worth considering later;
   the current `Type=simple` semantics are unchanged by socket activation.
+
+## Amendments (2026-07-09, post-review)
+
+Final code review of the branch surfaced two Important findings, corrected
+here and in the packaging/docs files themselves:
+
+- **Packaging / `RuntimeDirectory`:** the original text ("harmless under
+  activation, useful for self-bind fallback") was wrong. Under socket
+  activation, `RuntimeDirectory=wattch` with the default
+  `RuntimeDirectoryPreserve=no` means a stop/restart of the *service* unit
+  removes `/run/wattch`, unlinking the socket unit's listening socket and
+  breaking activation until the socket unit is itself restarted. Fixed by
+  adding `RuntimeDirectoryPreserve=yes` to `wattch-powerd.service`.
+- **Documented caveat: egid only** — the sentence describing group-based
+  access implied file permissions (SocketGroup=) alone were sufficient to
+  grant a group access. The two layers AND together: a group grant needs
+  `SocketGroup=` (layer 1) **and** a peer-policy grant on `ExecStart`
+  (layer 2, `--allow-uid`/`--allow-gid`). Corrected in this spec and in
+  `docs/powerd.md`, `packaging/wattch-powerd.socket`, and
+  `packaging/wattch-powerd.service`.

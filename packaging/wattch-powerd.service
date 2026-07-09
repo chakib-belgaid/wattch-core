@@ -9,14 +9,22 @@ Type=simple
 # No --socket flag: with wattch-powerd.socket active, systemd passes the
 # pre-bound socket via LISTEN_FDS and the daemon serves on it (path, mode,
 # and ownership live in the .socket unit). Passing --socket alongside an
-# activated fd is a startup error. Without the socket unit (self-bind
-# fallback), the daemon binds /run/wattch/wattch-powerd.sock itself when
-# running as root — same path, imperative mode.
+# activated fd is a startup error. The self-bind fallback (daemon binds
+# /run/wattch/wattch-powerd.sock itself when running as root — same path,
+# imperative mode) applies when the binary is run outside these units
+# (e.g. by hand or via a custom unit); this service unit itself Requires=
+# wattch-powerd.socket and will not start without it.
 ExecStart=/usr/local/bin/wattch-powerd \
   --backend linux-rapl \
   --node-id %H
 RuntimeDirectory=wattch
 RuntimeDirectoryMode=0750
+# The socket unit's listening socket lives in this directory. Without
+# Preserve=yes, a stop/restart of THIS service (RuntimeDirectory is
+# service-scoped) would have systemd remove /run/wattch and unlink the
+# listening socket, breaking activation until the socket unit itself is
+# restarted.
+RuntimeDirectoryPreserve=yes
 # The daemon only needs read access to /sys/class/powercap. Running as a
 # dedicated user with the powercap files made group-readable is preferred;
 # running as root works out of the box.
@@ -26,16 +34,18 @@ User=root
 # Fine-grained RAPL energy counters are a documented side channel (PLATYPUS,
 # CVE-2020-8694), which is why modern kernels restrict energy_uj to root.
 # wattch-powerd re-exposes those counters over this socket. Two layers gate
-# access:
+# access, and BOTH must admit a peer — they AND together, neither is
+# sufficient alone:
 #   1. File permissions: /run/wattch is 0750 and the socket 0660, both set
 #      declaratively in wattch-powerd.socket (SocketMode=/SocketGroup=) under
 #      socket activation, or imperatively by the daemon when self-binding.
-#      Grant a trusted group via SocketGroup= in the .socket unit.
+#      This layer alone does not grant access — see layer 2.
 #   2. Kernel-verified peer credentials (SO_PEERCRED), checked at accept()
 #      time: by default only uid 0 and the daemon's own uid may connect.
 #      Broaden with repeatable --allow-uid/--allow-gid flags on ExecStart.
-#      Note --allow-gid matches the peer's EFFECTIVE gid only; supplementary
-#      group membership is only honored by layer 1's file permissions.
+#      A group grant therefore needs BOTH SocketGroup= above AND an
+#      --allow-uid (reliable) or --allow-gid (matches the peer's EFFECTIVE
+#      gid only, not supplementary groups) flag here.
 # -----------------------------------------------------------------------------
 Restart=on-failure
 RestartSec=2
