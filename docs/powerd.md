@@ -91,9 +91,9 @@ The socket is not left to inherited/default permissions:
 
 For a shared machine under systemd, `RuntimeDirectory=wattch` (see
 `packaging/wattch-powerd.service`) gives `/run/wattch` mode 0750 owned by
-root; grant a group of trusted local users access via `Group=` on the unit
-(or `chgrp` the socket in an `ExecStartPost`) rather than widening the
-socket's own permissions.
+root; grant a group of trusted local users access via `SocketGroup=` in
+`packaging/wattch-powerd.socket` plus a peer-policy grant (see the next
+subsection) rather than widening the socket's own permissions.
 
 ### Peer authentication
 
