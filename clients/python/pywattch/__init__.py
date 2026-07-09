@@ -66,3 +66,9 @@ def __getattr__(name: str):
 
         return EnergyProfiler
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include the lazily-exported names (e.g. EnergyProfiler) in dir(), which
+    the module-level __getattr__ hook would otherwise hide from introspection."""
+    return sorted(__all__)

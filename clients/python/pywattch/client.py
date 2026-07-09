@@ -51,7 +51,7 @@ def default_socket_candidates() -> list[str]:
     xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime_dir:
         candidates.append(os.path.join(xdg_runtime_dir, "wattch", "wattch-powerd.sock"))
-    candidates.append(f"/tmp/wattch-powerd-{os.getuid()}.sock")
+    candidates.append(f"/tmp/wattch-powerd-{os.geteuid()}.sock")
     return candidates
 
 
@@ -65,10 +65,9 @@ def default_socket_path() -> str:
     return _first_existing(default_socket_candidates())
 
 
-# Kept for backward compatibility: existing call sites (`meter.py`,
-# `profiler.py`, `energytest/`) import this constant. It is a snapshot taken
-# at import time, not env/uid-driven at call time -- prefer
-# `default_socket_path()` in new code.
+# Kept as a public backward-compat export (re-exported from the package root).
+# It is a snapshot taken at import time, not env/uid-driven at call time --
+# prefer `default_socket_path()` in new code.
 DEFAULT_SOCKET_PATH = default_socket_path()
 
 
@@ -89,7 +88,14 @@ class WattchClient:
         client_name: str = "pywattch",
         connect_timeout_s: float = 5.0,
     ):
-        socket_path = socket_path if socket_path is not None else default_socket_path()
+        # When the caller relies on the default, remember the candidates so a
+        # connection failure can report every path we probed, not just the
+        # highest-priority one `default_socket_path()` happens to return.
+        if socket_path is None:
+            candidates: list[str] | None = default_socket_candidates()
+            socket_path = _first_existing(candidates)
+        else:
+            candidates = None
         self.socket_path = socket_path
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(connect_timeout_s)
@@ -97,21 +103,28 @@ class WattchClient:
             self._sock.connect(socket_path)
         except OSError as exc:
             self._sock.close()
-            raise WattchConnectionError(
-                f"failed to connect to wattch daemon at {socket_path}: {exc}"
-            ) from exc
+            detail = f"failed to connect to wattch daemon at {socket_path}"
+            if candidates is not None:
+                detail += f" (auto-detected; tried {', '.join(candidates)})"
+            raise WattchConnectionError(f"{detail}: {exc}") from exc
         self._sock.settimeout(None)
 
-        write_frame(
-            self._sock,
-            FrameKind.HELLO_REQUEST,
-            encode_hello_request(client_name, __version__),
-        )
-        hello = self._read_expected(FrameKind.HELLO_RESPONSE, "HelloResponse")
-        if not isinstance(hello, HelloResponse):
-            raise WattchProtocolError(
-                f"expected HelloResponse, decoded {type(hello).__name__}"
+        # Close the socket if the handshake fails midway, so a rejected or
+        # malformed Hello doesn't leak the fd on a client we can't return.
+        try:
+            write_frame(
+                self._sock,
+                FrameKind.HELLO_REQUEST,
+                encode_hello_request(client_name, __version__),
             )
+            hello = self._read_expected(FrameKind.HELLO_RESPONSE, "HelloResponse")
+            if not isinstance(hello, HelloResponse):
+                raise WattchProtocolError(
+                    f"unexpected {type(hello).__name__}, expected HelloResponse"
+                )
+        except BaseException:
+            self.close()
+            raise
         self.hello: HelloResponse = hello
 
     # -- introspection -----------------------------------------------------
@@ -146,7 +159,7 @@ class WattchClient:
         ack = self._read_expected(FrameKind.START_CAPTURE_ACK, "StartCaptureAck")
         if not isinstance(ack, StartCaptureAck):
             raise WattchProtocolError(
-                f"expected StartCaptureAck, decoded {type(ack).__name__}"
+                f"unexpected {type(ack).__name__}, expected StartCaptureAck"
             )
         return ack
 

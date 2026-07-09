@@ -41,6 +41,14 @@ def test_all_new_names_are_in_dunder_all():
         assert name in pywattch.__all__
 
 
+def test_dir_includes_lazily_exported_names():
+    # The module-level __getattr__ hook hides EnergyProfiler from a default
+    # dir(); the __dir__ hook must surface every __all__ name for tooling.
+    listing = dir(pywattch)
+    assert "EnergyProfiler" in listing
+    assert set(pywattch.__all__) <= set(listing)
+
+
 def test_import_pywattch_works_without_pyinstrument():
     """Bare `import pywattch` must not require the optional profiler extra.
 

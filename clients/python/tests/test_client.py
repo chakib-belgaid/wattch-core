@@ -1,3 +1,5 @@
+import socket
+
 import pytest
 
 from pywattch import (
@@ -7,7 +9,7 @@ from pywattch import (
     WattchProtocolError,
 )
 from pywattch import client as client_module
-from pywattch._messages import StartCaptureAck
+from pywattch._messages import HelloResponse, StartCaptureAck
 
 
 def test_hello_exposes_sources(fake_daemon):
@@ -71,9 +73,43 @@ def test_hello_with_wrong_message_type_raises_protocol_error(fake_daemon, monkey
         WattchClient(fake_daemon.socket_path)
 
 
-def test_start_capture_with_wrong_message_type_raises_protocol_error(fake_daemon, monkeypatch):
-    from pywattch._messages import HelloResponse
+def test_autodetect_connection_error_lists_every_candidate(monkeypatch):
+    tried = [
+        "/tmp/wattch-none-a.sock",
+        "/tmp/wattch-none-b.sock",
+        "/tmp/wattch-none-c.sock",
+    ]
+    monkeypatch.setattr(client_module, "default_socket_candidates", lambda: list(tried))
+    with pytest.raises(WattchConnectionError) as excinfo:
+        WattchClient()  # no explicit socket -> auto-detect
+    message = str(excinfo.value)
+    assert "auto-detected" in message
+    for path in tried:
+        assert path in message
 
+
+def test_handshake_failure_closes_socket(fake_daemon, monkeypatch):
+    # A rejected/malformed Hello raised mid-__init__ must not leak the fd.
+    created: list[socket.socket] = []
+    real_socket = socket.socket
+
+    def tracking_socket(*args, **kwargs):
+        sock = real_socket(*args, **kwargs)
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(client_module.socket, "socket", tracking_socket)
+    bogus = StartCaptureAck(run_id="not-a-hello", accepted_source_ids=())
+    monkeypatch.setattr(client_module, "decode_payload", lambda kind, payload: bogus)
+
+    with pytest.raises(WattchProtocolError):
+        WattchClient(fake_daemon.socket_path)
+
+    assert created, "expected the client to create a socket"
+    assert created[0].fileno() == -1, "socket should be closed after handshake failure"
+
+
+def test_start_capture_with_wrong_message_type_raises_protocol_error(fake_daemon, monkeypatch):
     with WattchClient(fake_daemon.socket_path) as client:
         bogus = HelloResponse(
             daemon_name="x",

@@ -46,8 +46,8 @@ all resolve the same default, in priority order:
 `<name>` is `wattch-powerd.sock` for the powermeter daemon and
 `wattch-testd.sock` for the deterministic test daemon. A client (`wattch`,
 `pywattch`) probes the same three paths in order and connects to the first
-one that exists; if none exist, it fails with an error listing every path it
-tried.
+one that exists. When none exist and the default was used, both clients
+report the paths they tried in the connection error.
 
 ```bash
 # Development (any OS): binds under $XDG_RUNTIME_DIR or a per-uid /tmp path.

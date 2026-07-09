@@ -201,14 +201,18 @@ fn main() -> Result<()> {
 /// Resolve the daemon socket to connect to. An explicit `--socket` always
 /// wins; otherwise probe the shared default candidates (see
 /// `wattch_protocol::socket`) and use the first one that exists, or fail
-/// listing every path tried.
+/// listing every path tried. `wattch-powerd` is preferred; the deterministic
+/// `wattch-testd` sockets are probed last so a dev `wattch sources` against a
+/// running testd works without `--socket`.
 fn resolve_socket(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
-    resolve_from_candidates(wattch_protocol::socket::default_connect_candidates(
-        "wattch-powerd.sock",
-    ))
+    let mut candidates = wattch_protocol::socket::default_connect_candidates("wattch-powerd.sock");
+    candidates.extend(wattch_protocol::socket::default_connect_candidates(
+        "wattch-testd.sock",
+    ));
+    resolve_from_candidates(candidates)
 }
 
 fn resolve_from_candidates(candidates: Vec<PathBuf>) -> Result<PathBuf> {

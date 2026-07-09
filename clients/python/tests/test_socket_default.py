@@ -38,7 +38,7 @@ def test_first_existing_falls_back_to_first_candidate_when_none_exist():
 def test_default_socket_candidates_order_is_run_then_xdg_then_tmp(monkeypatch, tmp_path):
     xdg = tmp_path / "run-user-501"
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
-    monkeypatch.setattr(os, "getuid", lambda: 501)
+    monkeypatch.setattr(os, "geteuid", lambda: 501)
 
     candidates = default_socket_candidates()
 
@@ -51,7 +51,7 @@ def test_default_socket_candidates_order_is_run_then_xdg_then_tmp(monkeypatch, t
 
 def test_default_socket_candidates_skips_xdg_when_unset(monkeypatch):
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setattr(os, "getuid", lambda: 501)
+    monkeypatch.setattr(os, "geteuid", lambda: 501)
 
     candidates = default_socket_candidates()
 
@@ -60,7 +60,7 @@ def test_default_socket_candidates_skips_xdg_when_unset(monkeypatch):
 
 def test_default_socket_candidates_skips_xdg_when_empty(monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", "")
-    monkeypatch.setattr(os, "getuid", lambda: 501)
+    monkeypatch.setattr(os, "geteuid", lambda: 501)
 
     candidates = default_socket_candidates()
 
@@ -75,7 +75,7 @@ def test_default_socket_path_prefers_existing_xdg_socket(monkeypatch, tmp_path):
     socket_path.touch()
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
-    monkeypatch.setattr(os, "getuid", lambda: 501)
+    monkeypatch.setattr(os, "geteuid", lambda: 501)
 
     assert default_socket_path() == str(socket_path)
 
@@ -85,7 +85,7 @@ def test_default_socket_path_falls_back_to_first_candidate_when_none_exist(
 ):
     xdg = tmp_path / "does-not-exist"
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
-    monkeypatch.setattr(os, "getuid", lambda: 999999)
+    monkeypatch.setattr(os, "geteuid", lambda: 999999)
 
     # None of the three candidates exist in a throwaway tmp_path/uid, so the
     # highest-priority candidate is returned anyway -- the caller (WattchClient
