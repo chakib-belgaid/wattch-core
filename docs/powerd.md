@@ -95,14 +95,54 @@ root; grant a group of trusted local users access via `Group=` on the unit
 (or `chgrp` the socket in an `ExecStartPost`) rather than widening the
 socket's own permissions.
 
+### Peer authentication
+
+File permissions are only one layer. The daemon also checks every
+connecting process's kernel-verified credentials (`SO_PEERCRED`) at
+accept() time, before any protocol traffic:
+
+- **Default policy:** uid 0 and the daemon's own effective uid may
+  connect; everyone else receives an `Error` frame (code 6,
+  `ACCESS_DENIED`, message "access denied") and the connection is closed.
+  Rejections are logged with the peer's uid, gid, and pid.
+- **Broadening access:** repeatable `--allow-uid <UID>` and
+  `--allow-gid <GID>` flags on `wattch-powerd` (and `wattch-testd`).
+- **egid caveat:** `SO_PEERCRED` reports the peer's *effective* gid, not
+  supplementary groups. `--allow-gid` therefore matches egid only: a user
+  whose supplementary groups include `wattch` will NOT pass the gid
+  check. Group-based human access remains the job of the 0660 socket
+  file permissions (which do honor supplementary groups); `--allow-uid`
+  is the explicit-grant mechanism.
+- **Non-Linux builds** (development only; RAPL is Linux-only) have no
+  credential facility: the daemon allows all peers and logs a warning at
+  startup. Production deployments are Linux.
+
 ## systemd
 
-A hardened unit is provided in `packaging/wattch-powerd.service`:
+Two units are provided in `packaging/`. The recommended deployment is
+socket activation: systemd owns the socket file (path, mode, group) and
+starts the daemon on demand.
 
 ```bash
 sudo install -m 755 target/release/wattch-powerd /usr/local/bin/
+sudo install -m 644 packaging/wattch-powerd.socket /etc/systemd/system/
 sudo install -m 644 packaging/wattch-powerd.service /etc/systemd/system/
-sudo systemctl enable --now wattch-powerd
+sudo systemctl enable --now wattch-powerd.socket
+```
+
+Under activation the daemon detects the passed fd (`LISTEN_FDS`) and
+serves on it; it neither chmods nor unlinks the socket — the `.socket`
+unit's `SocketMode=`/`SocketGroup=`/`RemoveOnStop=` govern its lifecycle.
+Passing `--socket` while an activated fd is present is a startup error
+(conflicting intent is never silently resolved). Without the socket unit,
+the daemon self-binds exactly as before; peer authentication applies
+identically on both paths.
+
+To try activation without installing units:
+
+```bash
+systemd-socket-activate -l /tmp/test.sock ./target/debug/wattch-powerd --backend synthetic
+wattch sources --socket /tmp/test.sock
 ```
 
 ## Failure behavior
@@ -113,6 +153,8 @@ startup    refuses to start if another daemon listens on the socket;
            linux-rapl backend is probed once so misconfiguration fails fast
 runtime    a zone that becomes unreadable is skipped for that tick and
            logged; the capture continues and the trace shows the gap
+access     a peer that fails the credential check gets Error code 6
+           (ACCESS_DENIED) and is disconnected; the event is logged at warn
 shutdown   SIGINT/SIGTERM terminate the process; the next start cleans the
            stale socket
 ```
