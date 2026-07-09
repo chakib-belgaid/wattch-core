@@ -63,6 +63,7 @@ pub mod error_codes {
     pub const UNKNOWN_SOURCE_ID: u32 = 3;
     pub const CAPTURE_ALREADY_ACTIVE: u32 = 4;
     pub const NO_ACTIVE_CAPTURE: u32 = 5;
+    pub const ACCESS_DENIED: u32 = 6;
     pub const INTERNAL: u32 = 100;
 }
 
