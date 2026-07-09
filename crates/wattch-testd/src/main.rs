@@ -22,6 +22,17 @@ struct Args {
     /// Print generated batches instead of binding the socket.
     #[arg(long)]
     dry_run: bool,
+
+    /// Additional uid allowed to connect (repeatable). uid 0 and the
+    /// daemon's own effective uid are always allowed.
+    #[arg(long = "allow-uid", value_name = "UID")]
+    allow_uid: Vec<u32>,
+
+    /// Additional gid allowed to connect (repeatable). Matches the peer's
+    /// EFFECTIVE gid only — supplementary group membership does not count;
+    /// use the socket file's group permissions (or --allow-uid) for that.
+    #[arg(long = "allow-gid", value_name = "GID")]
+    allow_gid: Vec<u32>,
 }
 
 fn main() -> Result<()> {
@@ -61,7 +72,7 @@ fn main() -> Result<()> {
         ServerConfig {
             socket: SocketSource::Bind(socket_path),
             identity,
-            peer_policy: PeerPolicy::with_grants(&[], &[]),
+            peer_policy: PeerPolicy::with_grants(&args.allow_uid, &args.allow_gid),
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
     )

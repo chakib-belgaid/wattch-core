@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+listenfd.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

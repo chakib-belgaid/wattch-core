@@ -41,6 +41,17 @@ struct Args {
     /// Seed for the synthetic backend.
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    /// Additional uid allowed to connect (repeatable). uid 0 and the
+    /// daemon's own effective uid are always allowed.
+    #[arg(long = "allow-uid", value_name = "UID")]
+    allow_uid: Vec<u32>,
+
+    /// Additional gid allowed to connect (repeatable). Matches the peer's
+    /// EFFECTIVE gid only — supplementary group membership does not count;
+    /// use the socket file's group permissions (or --allow-uid) for that.
+    #[arg(long = "allow-gid", value_name = "GID")]
+    allow_gid: Vec<u32>,
 }
 
 fn main() -> Result<()> {
@@ -90,19 +101,41 @@ fn main() -> Result<()> {
         BackendChoice::Auto => unreachable!("auto resolved above"),
     };
 
-    let socket_path = args
-        .socket
-        .unwrap_or_else(|| wattch_protocol::socket::default_bind_path("wattch-powerd.sock"));
+    // systemd socket activation: if systemd handed us a pre-bound socket
+    // (LISTEN_FDS), serve on it. The listenfd crate owns the only unsafe
+    // raw-fd conversion; this crate stays zero-unsafe.
+    let activated = listenfd::ListenFd::from_env()
+        .take_unix_listener(0)
+        .context("systemd-activated fd 0 is not a Unix stream listener")?;
+
+    let socket =
+        match activated {
+            Some(listener) => {
+                if let Some(socket) = &args.socket {
+                    anyhow::bail!(
+                        "--socket {} conflicts with a systemd-activated socket \
+                     (LISTEN_FDS is set); configure the path in the .socket \
+                     unit or drop the flag",
+                        socket.display()
+                    );
+                }
+                tracing::info!("using systemd-activated socket");
+                SocketSource::Activated(listener)
+            }
+            None => SocketSource::Bind(args.socket.clone().unwrap_or_else(|| {
+                wattch_protocol::socket::default_bind_path("wattch-powerd.sock")
+            })),
+        };
 
     let handle = wattch_daemon::spawn(
         ServerConfig {
-            socket: SocketSource::Bind(socket_path),
+            socket,
             identity: DaemonIdentity {
                 daemon_name: "wattch-powerd".to_string(),
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 node_id: args.node_id.clone(),
             },
-            peer_policy: PeerPolicy::with_grants(&[], &[]),
+            peer_policy: PeerPolicy::with_grants(&args.allow_uid, &args.allow_gid),
         },
         move || make_backend(),
     )
