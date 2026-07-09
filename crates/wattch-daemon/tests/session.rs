@@ -493,3 +493,52 @@ fn activated_listener_serves_and_socket_survives_shutdown() {
     );
     let _ = std::fs::remove_file(&socket_path);
 }
+
+/// Linux-only: on non-Linux dev builds there are no peer credentials, so
+/// there is nothing to deny (the server allows all peers by design there).
+#[cfg(target_os = "linux")]
+#[test]
+fn deny_all_policy_rejects_with_access_denied() {
+    let socket_path = std::env::temp_dir().join(format!(
+        "wattch-daemon-test-deny-all-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let handle = spawn(
+        ServerConfig {
+            socket: SocketSource::Bind(socket_path.clone()),
+            identity: DaemonIdentity {
+                daemon_name: "wattch-daemon-test".to_string(),
+                daemon_version: "0.0.0".to_string(),
+                node_id: "node-test".to_string(),
+            },
+            // Built literally (fields are public) — with_grants() would
+            // always re-admit our own euid.
+            peer_policy: PeerPolicy {
+                allowed_uids: vec![],
+                allowed_gids: vec![],
+            },
+        },
+        || Box::new(CountingBackend::new()),
+    )
+    .expect("server should start");
+
+    let mut stream = UnixStream::connect(&socket_path).unwrap();
+    match read_message(&mut stream) {
+        Ok(Message::Error(err)) => {
+            assert_eq!(err.code, error_codes::ACCESS_DENIED);
+            assert_eq!(err.message, "access denied");
+        }
+        other => panic!("expected ACCESS_DENIED Error frame, got {other:?}"),
+    }
+    // After the error frame the daemon closes the connection.
+    assert!(
+        read_message(&mut stream).is_err(),
+        "connection must be closed after rejection"
+    );
+
+    // Shutdown still works under deny-all: the wake-up connect only needs
+    // the accept() to fire; rejection happens after accept.
+    handle.shutdown();
+}

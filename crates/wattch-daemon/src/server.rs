@@ -1,5 +1,5 @@
 use crate::backend::SampleBackend;
-use crate::peer::PeerPolicy;
+use crate::peer::{peer_credentials, PeerPolicy};
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
@@ -153,7 +153,12 @@ where
     let accept_stop = Arc::clone(&stop);
     let identity = config.identity;
     let factory = Arc::new(factory);
-    let _peer_policy = config.peer_policy;
+    let peer_policy = config.peer_policy;
+    #[cfg(not(target_os = "linux"))]
+    warn!(
+        "peer authentication unavailable on this platform; \
+         dev builds only — production target is Linux"
+    );
 
     let accept_thread = thread::spawn(move || {
         for connection in listener.incoming() {
@@ -161,7 +166,30 @@ where
                 break;
             }
             match connection {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Kernel-verified peer check before any protocol I/O.
+                    // A credential-read failure is a deny, not an allow;
+                    // Ok(None) means this platform has no credential
+                    // facility (non-Linux dev builds — warned at startup).
+                    match peer_credentials(&stream) {
+                        Ok(None) => {}
+                        Ok(Some(creds)) if peer_policy.permits(creds.uid, creds.gid) => {}
+                        Ok(Some(creds)) => {
+                            warn!(
+                                uid = creds.uid,
+                                gid = creds.gid,
+                                pid = creds.pid,
+                                "rejecting peer: uid/gid not in allowed lists"
+                            );
+                            send_error(&mut stream, error_codes::ACCESS_DENIED, "access denied");
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "rejecting peer: cannot read credentials");
+                            send_error(&mut stream, error_codes::ACCESS_DENIED, "access denied");
+                            continue;
+                        }
+                    }
                     let identity = identity.clone();
                     let backend = factory();
                     thread::spawn(move || {
