@@ -1,3 +1,7 @@
+import socket
+import threading
+import time
+
 import pytest
 
 from pywattch._frames import (
@@ -6,8 +10,9 @@ from pywattch._frames import (
     FrameKind,
     decode_header,
     encode_frame,
+    read_frame,
 )
-from pywattch.errors import WattchProtocolError
+from pywattch.errors import WattchConnectionError, WattchProtocolError
 
 
 def test_frame_layout_is_byte_compatible_with_rust():
@@ -64,3 +69,27 @@ def test_rejects_oversized_payload_header():
     frame[12:16] = (MAX_PAYLOAD_LEN + 1).to_bytes(4, "little")
     with pytest.raises(WattchProtocolError, match="too large"):
         decode_header(bytes(frame))
+
+
+def test_read_deadline_is_absolute_across_trickled_bytes():
+    reader, writer = socket.socketpair()
+    reader.settimeout(0.08)
+    frame = encode_frame(FrameKind.HELLO_RESPONSE, b"{}")
+
+    def trickle() -> None:
+        try:
+            for byte in frame:
+                writer.send(bytes([byte]))
+                time.sleep(0.03)
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=trickle, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    with pytest.raises(WattchConnectionError):
+        read_frame(reader)
+    assert time.monotonic() - started < 0.2
+    reader.close()
+    writer.close()
+    thread.join(timeout=0.2)

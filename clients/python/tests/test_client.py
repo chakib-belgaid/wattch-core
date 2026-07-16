@@ -5,11 +5,10 @@ import pytest
 from pywattch import (
     WattchClient,
     WattchConnectionError,
-    WattchDaemonError,
     WattchProtocolError,
 )
 from pywattch import client as client_module
-from pywattch._messages import HelloResponse, StartCaptureAck
+from pywattch._messages import HelloResponse, RawSample, RawSampleBatch, StartCaptureAck
 
 
 def test_hello_exposes_sources(fake_daemon):
@@ -52,11 +51,10 @@ def test_capture_with_source_filter(fake_daemon):
         assert {s.source_id for s in batch.samples} == {1}
 
 
-def test_unknown_source_id_raises_daemon_error(fake_daemon):
+def test_unknown_source_id_is_rejected_before_sending(fake_daemon):
     with WattchClient(fake_daemon.socket_path) as client:
-        with pytest.raises(WattchDaemonError) as excinfo:
+        with pytest.raises(WattchProtocolError, match="unknown source ids"):
             client.start_capture("run-x", source_ids=[99])
-        assert excinfo.value.code == 3
 
 
 def test_missing_socket_raises_connection_error():
@@ -131,3 +129,59 @@ def test_abandoned_stream_leaves_connection_usable(fake_daemon):
 
         batches = client.capture(duration_s=0.05, interval_ms=5)
     assert batches
+
+
+def test_start_ack_is_bound_to_requested_run(fake_daemon, monkeypatch):
+    with WattchClient(fake_daemon.socket_path) as client:
+        monkeypatch.setattr(
+            client,
+            "_read_expected",
+            lambda *_args: StartCaptureAck(
+                run_id="other-run",
+                accepted_source_ids=tuple(s.local_source_id for s in client.sources),
+            ),
+        )
+        with pytest.raises(WattchProtocolError, match="does not match"):
+            client.start_capture("expected-run")
+
+
+def test_batch_identity_and_sequence_replay_are_rejected(fake_daemon):
+    with WattchClient(fake_daemon.socket_path) as client:
+        client.start_capture("bound-run", interval_ms=5, source_ids=[1])
+        wrong_run = RawSampleBatch(
+            run_id="other-run",
+            node_id=client.node_id,
+            batch_sequence_no=0,
+            samples=(RawSample(1, 0, 1, 1),),
+        )
+        with pytest.raises(WattchProtocolError, match="batch run_id"):
+            client._validate_batch(wrong_run)
+
+        valid = RawSampleBatch(
+            run_id="bound-run",
+            node_id=client.node_id,
+            batch_sequence_no=0,
+            samples=(RawSample(1, 0, 1, 1),),
+        )
+        client._validate_batch(valid)
+        with pytest.raises(WattchProtocolError, match="batch sequence"):
+            client._validate_batch(valid)
+
+        negative = RawSampleBatch(
+            run_id="bound-run",
+            node_id=client.node_id,
+            batch_sequence_no=1,
+            samples=(RawSample(1, -1, 2, 1),),
+        )
+        with pytest.raises(WattchProtocolError, match="unsigned 64-bit"):
+            client._validate_batch(negative)
+
+
+def test_run_id_and_post_stop_drain_are_bounded(fake_daemon):
+    with WattchClient(fake_daemon.socket_path) as client:
+        with pytest.raises(WattchProtocolError, match="256"):
+            client.start_capture("x" * 257)
+
+        client.start_capture("bounded-drain", interval_ms=5)
+        with pytest.raises(WattchProtocolError, match="drain limit"):
+            client.stop_capture("bounded-drain", max_drained_batches=0)

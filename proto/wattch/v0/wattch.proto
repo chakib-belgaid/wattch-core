@@ -95,9 +95,14 @@ message RawSample {
 }
 
 message RawSampleBatch {
+  // Must equal the run id acknowledged for the active capture. Implemented
+  // v0.1 transports bound this field to 256 UTF-8 bytes.
   string run_id = 1;
+  // Must equal HelloResponse.node_id for this connection.
   string node_id = 2;
+  // Must move forward within a connection; replay/reordering is invalid.
   uint64 batch_sequence_no = 3;
+  // At most one sample per advertised source in each batch.
   repeated RawSample samples = 4;
 }
 
@@ -132,7 +137,9 @@ message HelloResponse {
 }
 
 message StartCapture {
+  // Non-empty, no control characters, at most 256 UTF-8 bytes.
   string run_id = 1;
+  // Unique ids drawn from HelloResponse.sources.
   repeated uint32 source_ids = 2;
   optional uint64 requested_period_ns = 3;
   map<string, string> labels = 4;

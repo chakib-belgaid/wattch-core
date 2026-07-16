@@ -1,15 +1,20 @@
 use std::collections::BTreeMap;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Duration;
 use wattch_cli::artifact::{inspect_run, read_manifest, replay_trace, ArtifactError, RunWriter};
-use wattch_cli::client::WattchClient;
+use wattch_cli::client::{ClientError, WattchClient};
 use wattch_core::{
-    EvidenceClass, RawValue, RunManifest, SamplingMode, SourceDescriptor, SourceKind, Temporality,
-    Unit,
+    EvidenceClass, RawSample, RawSampleBatch, RawValue, RunManifest, SamplingMode,
+    SourceDescriptor, SourceKind, Temporality, Unit,
 };
 use wattch_daemon::{
     DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, ServerHandle, SocketSource,
 };
+use wattch_protocol::messages::{
+    read_message, write_message, HelloResponse, Message, StartCaptureAck,
+};
+use wattch_protocol::PROTOCOL_VERSION;
 
 struct RampBackend {
     descriptors: Vec<SourceDescriptor>,
@@ -63,6 +68,7 @@ fn start_server(name: &str) -> (ServerHandle, PathBuf) {
                 node_id: "node-cli".to_string(),
             },
             peer_policy: PeerPolicy::with_grants(&[], &[]),
+            limits: Default::default(),
         },
         || {
             Box::new(RampBackend {
@@ -79,6 +85,32 @@ fn temp_out(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("wattch-cli-out-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+fn raw_batch(run_id: &str, batch_sequence_no: u64, sequence_no: u64) -> RawSampleBatch {
+    RawSampleBatch {
+        run_id: run_id.to_string(),
+        node_id: "node-cli".to_string(),
+        batch_sequence_no,
+        samples: vec![RawSample {
+            source_id: 1,
+            sequence_no,
+            monotonic_ns: sequence_no * 1_000,
+            value: RawValue::I64(sequence_no as i64),
+        }],
+    }
+}
+
+fn manifest(run_id: &str) -> RunManifest {
+    RunManifest {
+        run_id: run_id.to_string(),
+        node_id: "node-cli".to_string(),
+        protocol_version: "0.1.0".to_string(),
+        wattch_version: "test".to_string(),
+        created_unix_ns: 1,
+        sources: vec![descriptor(1, "cpu/package/0/energy")],
+        labels: BTreeMap::new(),
+    }
 }
 
 #[test]
@@ -102,9 +134,12 @@ fn capture_writes_replayable_artifact() {
 
     let mut writer = RunWriter::create(&out_root, &manifest).unwrap();
     let ack = client
-        .capture("run-artifact-test", 5, Duration::from_millis(60), |batch| {
-            writer.append_batch(&batch).unwrap()
-        })
+        .capture(
+            "run-artifact-test",
+            10,
+            Duration::from_millis(60),
+            |batch| writer.append_batch(&batch).unwrap(),
+        )
         .unwrap();
     let run_dir = writer.finish().unwrap();
     assert!(ack.batches_sent >= 2);
@@ -139,7 +174,7 @@ fn run_writer_refuses_to_overwrite_existing_run() {
     let out_root = temp_out("no-overwrite");
     let manifest = RunManifest {
         run_id: "run-dup".to_string(),
-        node_id: "n".to_string(),
+        node_id: "node-cli".to_string(),
         protocol_version: "0.1.0".to_string(),
         wattch_version: "test".to_string(),
         created_unix_ns: 1,
@@ -161,7 +196,7 @@ fn replay_and_inspect_on_truncated_trace_return_clean_errors_not_panics() {
     let out_root = temp_out("truncated-trace");
     let manifest = RunManifest {
         run_id: "run-truncated".to_string(),
-        node_id: "n".to_string(),
+        node_id: "node-cli".to_string(),
         protocol_version: "0.1.0".to_string(),
         wattch_version: "test".to_string(),
         created_unix_ns: 1,
@@ -195,4 +230,127 @@ fn connect_to_missing_socket_fails_clearly() {
     let err = WattchClient::connect(std::path::Path::new("/tmp/wattch-definitely-missing.sock"))
         .unwrap_err();
     assert!(err.to_string().contains("failed to connect"));
+}
+
+#[test]
+fn run_writer_rejects_path_traversal_and_spliced_batches() {
+    let out_root = temp_out("integrity-writer");
+    assert!(matches!(
+        RunWriter::create(&out_root, &manifest("../escape")),
+        Err(ArtifactError::MetadataMismatch(_))
+    ));
+
+    let mut writer = RunWriter::create(&out_root, &manifest("bound-run")).unwrap();
+    assert!(matches!(
+        writer.append_batch(&raw_batch("other-run", 0, 0)),
+        Err(ArtifactError::Integrity(_))
+    ));
+    writer.finish().unwrap();
+    let _ = std::fs::remove_dir_all(out_root);
+}
+
+#[test]
+fn inspect_rejects_metadata_drift_and_cross_run_trace_splicing() {
+    let out_root = temp_out("integrity-inspect");
+    let mut first = RunWriter::create(&out_root, &manifest("run-a")).unwrap();
+    first.append_batch(&raw_batch("run-a", 0, 0)).unwrap();
+    let run_a = first.finish().unwrap();
+
+    let mut second = RunWriter::create(&out_root, &manifest("run-b")).unwrap();
+    second.append_batch(&raw_batch("run-b", 0, 0)).unwrap();
+    let run_b = second.finish().unwrap();
+
+    std::fs::copy(run_b.join("raw.trace.wch"), run_a.join("raw.trace.wch")).unwrap();
+    assert!(matches!(
+        replay_trace(&run_a, |_| {}),
+        Err(ArtifactError::Integrity(_))
+    ));
+    assert!(matches!(
+        inspect_run(&run_a),
+        Err(ArtifactError::Integrity(_))
+    ));
+
+    std::fs::write(run_b.join("sources.json"), "[]").unwrap();
+    assert!(matches!(
+        inspect_run(&run_b),
+        Err(ArtifactError::MetadataMismatch(_))
+    ));
+    let _ = std::fs::remove_dir_all(out_root);
+}
+
+#[test]
+fn rust_client_rejects_ack_and_batch_identity_substitution() {
+    for substitute_ack in [true, false] {
+        let tag = if substitute_ack {
+            "bad-ack"
+        } else {
+            "bad-batch"
+        };
+        let socket_path =
+            std::env::temp_dir().join(format!("wattch-hostile-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(matches!(
+                read_message(&mut stream).unwrap(),
+                Message::HelloRequest(_)
+            ));
+            write_message(
+                &mut stream,
+                &Message::HelloResponse(HelloResponse {
+                    daemon_name: "substitute".to_string(),
+                    daemon_version: "test".to_string(),
+                    protocol_version: PROTOCOL_VERSION.to_string(),
+                    node_id: "node-cli".to_string(),
+                    sources: vec![descriptor(1, "cpu/package/0/energy")],
+                }),
+            )
+            .unwrap();
+            assert!(matches!(
+                read_message(&mut stream).unwrap(),
+                Message::StartCapture(_)
+            ));
+            write_message(
+                &mut stream,
+                &Message::StartCaptureAck(StartCaptureAck {
+                    run_id: if substitute_ack {
+                        "other-run".to_string()
+                    } else {
+                        "expected-run".to_string()
+                    },
+                    accepted_source_ids: vec![1],
+                }),
+            )
+            .unwrap();
+            if !substitute_ack {
+                write_message(
+                    &mut stream,
+                    &Message::RawSampleBatch(raw_batch("other-run", 0, 0)),
+                )
+                .unwrap();
+            }
+            // Keep the socket alive long enough for the client to parse the
+            // deliberately inconsistent message before transport teardown.
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut client = WattchClient::connect(&socket_path).unwrap();
+        let error = client
+            .capture("expected-run", 10, Duration::from_millis(20), |_| {})
+            .unwrap_err();
+        if substitute_ack {
+            assert!(
+                matches!(error, ClientError::Protocol(_)),
+                "expected protocol identity error, got {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, ClientError::InvalidEvidence(_)),
+                "expected invalid-evidence error, got {error:?}"
+            );
+        }
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&socket_path);
+    }
 }

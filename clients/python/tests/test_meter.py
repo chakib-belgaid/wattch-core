@@ -92,6 +92,16 @@ class TestEnergyMeter:
             "total_joules",
         }
 
+    def test_instant_power_state_stays_constant_size(self, fake_daemon):
+        meter = EnergyMeter(fake_daemon.socket_path, interval_ms=2)
+        meter.start()
+        time.sleep(0.1)
+        with meter._lock:
+            assert set(meter._instant_last) == {3}
+            assert set(meter._instant_joules) == {3}
+            assert meter._instant_joules[3] > 0
+        meter.stop()
+
 
 class TestDecoratorAndContext:
     def test_measure_energy_decorator_invokes_handler(self, fake_daemon):

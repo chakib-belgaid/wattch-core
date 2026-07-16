@@ -201,7 +201,7 @@ def encode_stop_capture(run_id: str) -> bytes:
 def decode_payload(kind: FrameKind, payload: bytes) -> Any:
     try:
         data = json.loads(payload)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise WattchProtocolError(f"invalid JSON payload for {kind.name}: {exc}") from exc
 
     try:
@@ -228,7 +228,7 @@ def decode_payload(kind: FrameKind, payload: bytes) -> Any:
             return RawSampleBatch.from_dict(data)
         if kind == FrameKind.ERROR:
             return ErrorMessage(code=data["code"], message=data["message"])
-    except (KeyError, TypeError) as exc:
+    except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
         raise WattchProtocolError(f"malformed {kind.name} payload: {exc}") from exc
 
     raise WattchProtocolError(f"unexpected frame kind {kind.name} for a client")

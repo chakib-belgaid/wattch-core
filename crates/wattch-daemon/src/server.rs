@@ -1,13 +1,14 @@
 use crate::backend::SampleBackend;
 use crate::peer::{peer_credentials, PeerPolicy};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, Permissions};
-use std::io;
+use std::io::{self, Read};
+use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -15,8 +16,8 @@ use tracing::{debug, info, warn};
 use wattch_core::{validate_source_set, RawSample, RawSampleBatch, SourceDescriptor};
 use wattch_protocol::frame::WireError;
 use wattch_protocol::messages::{
-    error_codes, read_message, write_message, ErrorMessage, HelloResponse, Message,
-    StartCaptureAck, StopCaptureAck,
+    error_codes, read_message, validate_run_id, write_message, ErrorMessage, HelloResponse,
+    Message, StartCaptureAck, StopCaptureAck,
 };
 use wattch_protocol::PROTOCOL_VERSION;
 
@@ -45,6 +46,37 @@ pub struct ServerConfig {
     pub socket: SocketSource,
     pub identity: DaemonIdentity,
     pub peer_policy: PeerPolicy,
+    pub limits: ServerLimits,
+}
+
+/// Bounded defaults for untrusted local client sessions.
+#[derive(Clone, Debug)]
+pub struct ServerLimits {
+    pub max_connections: usize,
+    pub max_connections_per_uid: usize,
+    pub max_active_captures: usize,
+    pub max_active_captures_per_uid: usize,
+    pub hello_timeout: Duration,
+    pub session_idle_timeout: Duration,
+    pub max_capture_duration: Duration,
+    pub write_timeout: Duration,
+    pub min_interval_ms: u64,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_connections_per_uid: 16,
+            max_active_captures: 8,
+            max_active_captures_per_uid: 2,
+            hello_timeout: Duration::from_secs(5),
+            session_idle_timeout: Duration::from_secs(5 * 60),
+            max_capture_duration: Duration::from_secs(24 * 60 * 60),
+            write_timeout: Duration::from_secs(5),
+            min_interval_ms: 10,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -54,6 +86,79 @@ pub enum ServerError {
 
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("invalid server limits: {0}")]
+    InvalidLimits(String),
+}
+
+#[derive(Debug, Default)]
+struct PermitState {
+    total: usize,
+    per_uid: BTreeMap<u32, usize>,
+}
+
+#[derive(Debug)]
+struct PermitPool {
+    max_total: usize,
+    max_per_uid: usize,
+    state: Mutex<PermitState>,
+}
+
+impl PermitPool {
+    fn new(max_total: usize, max_per_uid: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_total,
+            max_per_uid,
+            state: Mutex::new(PermitState::default()),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, uid: Option<u32>) -> Option<Permit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.total >= self.max_total {
+            return None;
+        }
+        if let Some(uid) = uid {
+            if state.per_uid.get(&uid).copied().unwrap_or(0) >= self.max_per_uid {
+                return None;
+            }
+            *state.per_uid.entry(uid).or_default() += 1;
+        }
+        state.total += 1;
+        drop(state);
+        Some(Permit {
+            pool: Arc::clone(self),
+            uid,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Permit {
+    pool: Arc<PermitPool>,
+    uid: Option<u32>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.total = state.total.saturating_sub(1);
+        if let Some(uid) = self.uid {
+            if let Some(count) = state.per_uid.get_mut(&uid) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.per_uid.remove(&uid);
+                }
+            }
+        }
+    }
 }
 
 /// Handle to a running server. Dropping it does not stop the server;
@@ -99,11 +204,18 @@ pub fn spawn<F>(config: ServerConfig, factory: F) -> Result<ServerHandle, Server
 where
     F: Fn() -> Box<dyn SampleBackend> + Send + Sync + 'static,
 {
+    validate_limits(&config.limits)?;
     let probe = factory();
     validate_source_set(probe.descriptors())?;
     drop(probe);
 
-    let (listener, socket_path, owns_socket_file) = match config.socket {
+    let ServerConfig {
+        socket,
+        identity,
+        peer_policy,
+        limits,
+    } = config;
+    let (listener, socket_path, owns_socket_file) = match socket {
         SocketSource::Bind(path) => {
             ensure_socket_parent_dir(&path)?;
 
@@ -151,9 +263,12 @@ where
 
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
-    let identity = config.identity;
     let factory = Arc::new(factory);
-    let peer_policy = config.peer_policy;
+    let connection_pool = PermitPool::new(limits.max_connections, limits.max_connections_per_uid);
+    let capture_pool = PermitPool::new(
+        limits.max_active_captures,
+        limits.max_active_captures_per_uid,
+    );
     #[cfg(not(target_os = "linux"))]
     warn!(
         "peer authentication unavailable on this platform; \
@@ -167,13 +282,19 @@ where
             }
             match connection {
                 Ok(mut stream) => {
+                    if let Err(err) = stream.set_write_timeout(Some(limits.write_timeout)) {
+                        warn!(error = %err, "rejecting peer: cannot set write deadline");
+                        continue;
+                    }
                     // Kernel-verified peer check before any protocol I/O.
                     // A credential-read failure is a deny, not an allow;
                     // Ok(None) means this platform has no credential
                     // facility (non-Linux dev builds — warned at startup).
-                    match peer_credentials(&stream) {
-                        Ok(None) => {}
-                        Ok(Some(creds)) if peer_policy.permits(creds.uid, creds.gid) => {}
+                    let peer_uid = match peer_credentials(&stream) {
+                        Ok(None) => None,
+                        Ok(Some(creds)) if peer_policy.permits(creds.uid, creds.gid) => {
+                            Some(creds.uid)
+                        }
                         Ok(Some(creds)) => {
                             warn!(
                                 uid = creds.uid,
@@ -189,11 +310,34 @@ where
                             send_error(&mut stream, error_codes::ACCESS_DENIED, "access denied");
                             continue;
                         }
+                    };
+                    let Some(connection_permit) = connection_pool.try_acquire(peer_uid) else {
+                        warn!(uid = peer_uid, "rejecting peer: connection limit reached");
+                        send_error(
+                            &mut stream,
+                            error_codes::RESOURCE_EXHAUSTED,
+                            "connection limit reached",
+                        );
+                        continue;
+                    };
+                    if let Err(err) = stream.set_read_timeout(Some(limits.hello_timeout)) {
+                        warn!(error = %err, "rejecting peer: cannot set handshake timeout");
+                        continue;
                     }
                     let identity = identity.clone();
-                    let backend = factory();
+                    let factory = Arc::clone(&factory);
+                    let limits = limits.clone();
+                    let capture_pool = Arc::clone(&capture_pool);
                     thread::spawn(move || {
-                        if let Err(err) = handle_connection(stream, &identity, backend) {
+                        let _connection_permit = connection_permit;
+                        if let Err(err) = handle_connection(
+                            stream,
+                            &identity,
+                            factory.as_ref(),
+                            &limits,
+                            &capture_pool,
+                            peer_uid,
+                        ) {
                             debug!(error = %err, "connection ended with error");
                         }
                     });
@@ -211,6 +355,43 @@ where
         stop,
         accept_thread,
     })
+}
+
+fn validate_limits(limits: &ServerLimits) -> Result<(), ServerError> {
+    let counts = [
+        ("max_connections", limits.max_connections),
+        ("max_connections_per_uid", limits.max_connections_per_uid),
+        ("max_active_captures", limits.max_active_captures),
+        (
+            "max_active_captures_per_uid",
+            limits.max_active_captures_per_uid,
+        ),
+    ];
+    if let Some((name, _)) = counts.into_iter().find(|(_, value)| *value == 0) {
+        return Err(ServerError::InvalidLimits(format!(
+            "{name} must be non-zero"
+        )));
+    }
+    let durations = [
+        ("hello_timeout", limits.hello_timeout),
+        ("session_idle_timeout", limits.session_idle_timeout),
+        ("max_capture_duration", limits.max_capture_duration),
+        ("write_timeout", limits.write_timeout),
+    ];
+    if let Some((name, _)) = durations
+        .into_iter()
+        .find(|(_, duration)| duration.is_zero())
+    {
+        return Err(ServerError::InvalidLimits(format!(
+            "{name} must be non-zero"
+        )));
+    }
+    if limits.min_interval_ms == 0 {
+        return Err(ServerError::InvalidLimits(
+            "min_interval_ms must be non-zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Create the socket's parent directory (mode 0750) if it doesn't exist yet.
@@ -266,9 +447,12 @@ fn send_error(stream: &mut UnixStream, code: u32, message: impl Into<String>) {
 fn handle_connection(
     mut stream: UnixStream,
     identity: &DaemonIdentity,
-    mut backend: Box<dyn SampleBackend>,
+    factory: &(dyn Fn() -> Box<dyn SampleBackend> + Send + Sync),
+    limits: &ServerLimits,
+    capture_pool: &Arc<PermitPool>,
+    peer_uid: Option<u32>,
 ) -> Result<(), WireError> {
-    let first = match read_message(&mut stream) {
+    let first = match read_message_before(&mut stream, limits.hello_timeout) {
         Ok(message) => message,
         Err(WireError::ConnectionClosed) => return Ok(()),
         Err(err @ (WireError::Frame(_) | WireError::InvalidPayload { .. })) => {
@@ -277,6 +461,10 @@ fn handle_connection(
                 error_codes::PROTOCOL_VIOLATION,
                 err.to_string(),
             );
+            return Ok(());
+        }
+        Err(err) if is_timeout(&err) => {
+            send_error(&mut stream, error_codes::TIMEOUT, "hello deadline exceeded");
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -307,6 +495,7 @@ fn handle_connection(
 
     debug!(client = %hello.client_name, version = %hello.client_version, "client connected");
 
+    let mut backend = factory();
     let descriptors: Vec<SourceDescriptor> = backend.descriptors().to_vec();
     write_message(
         &mut stream,
@@ -325,7 +514,7 @@ fn handle_connection(
     let mut batch_sequence_no: u64 = 0;
 
     loop {
-        let request = match read_message(&mut stream) {
+        let request = match read_message_before(&mut stream, limits.session_idle_timeout) {
             Ok(message) => message,
             Err(WireError::ConnectionClosed) => return Ok(()),
             Err(err @ (WireError::Frame(_) | WireError::InvalidPayload { .. })) => {
@@ -336,25 +525,73 @@ fn handle_connection(
                 );
                 return Ok(());
             }
+            Err(err) if is_timeout(&err) => {
+                send_error(
+                    &mut stream,
+                    error_codes::TIMEOUT,
+                    "session idle deadline exceeded",
+                );
+                return Ok(());
+            }
             Err(err) => return Err(err),
         };
 
         match request {
             Message::StartCapture(start) => {
-                let all_ids: Vec<u32> = descriptors.iter().map(|d| d.local_source_id).collect();
-                let selected: Vec<u32> = if start.source_ids.is_empty() {
-                    all_ids.clone()
-                } else {
-                    start.source_ids.clone()
-                };
-                if let Some(unknown) = selected.iter().find(|id| !all_ids.contains(id)) {
+                if let Err(reason) = validate_run_id(&start.run_id) {
+                    send_error(&mut stream, error_codes::INVALID_REQUEST, reason);
+                    continue;
+                }
+                if start.interval_ms < limits.min_interval_ms {
                     send_error(
                         &mut stream,
-                        error_codes::UNKNOWN_SOURCE_ID,
-                        format!("unknown source id {unknown}"),
+                        error_codes::INVALID_REQUEST,
+                        format!("interval_ms must be at least {}", limits.min_interval_ms),
                     );
                     continue;
                 }
+
+                let all_ids: BTreeSet<u32> =
+                    descriptors.iter().map(|d| d.local_source_id).collect();
+                let unique = if start.source_ids.is_empty() {
+                    all_ids.clone()
+                } else {
+                    if start.source_ids.len() > all_ids.len() {
+                        send_error(
+                            &mut stream,
+                            error_codes::INVALID_REQUEST,
+                            "source_ids contains duplicates or too many entries",
+                        );
+                        continue;
+                    }
+                    let unique: BTreeSet<u32> = start.source_ids.iter().copied().collect();
+                    if unique.len() != start.source_ids.len() {
+                        send_error(
+                            &mut stream,
+                            error_codes::INVALID_REQUEST,
+                            "source_ids must not contain duplicates",
+                        );
+                        continue;
+                    }
+                    if let Some(unknown) = unique.iter().find(|id| !all_ids.contains(id)) {
+                        send_error(
+                            &mut stream,
+                            error_codes::UNKNOWN_SOURCE_ID,
+                            format!("unknown source id {unknown}"),
+                        );
+                        continue;
+                    }
+                    unique
+                };
+                let selected: Vec<u32> = unique.iter().copied().collect();
+                let Some(_capture_permit) = capture_pool.try_acquire(peer_uid) else {
+                    send_error(
+                        &mut stream,
+                        error_codes::RESOURCE_EXHAUSTED,
+                        "active capture limit reached",
+                    );
+                    continue;
+                };
 
                 write_message(
                     &mut stream,
@@ -369,11 +606,12 @@ fn handle_connection(
                     backend.as_mut(),
                     identity,
                     &start.run_id,
-                    Duration::from_millis(start.interval_ms.max(1)),
-                    &selected,
+                    Duration::from_millis(start.interval_ms),
+                    &unique,
                     session_start,
                     &mut sequence_numbers,
                     &mut batch_sequence_no,
+                    limits.max_capture_duration,
                 )?;
 
                 match summary {
@@ -391,22 +629,34 @@ fn handle_connection(
                         )?;
                     }
                     CaptureEnd::Disconnected => return Ok(()),
-                    CaptureEnd::ProtocolViolation(kind) => {
+                    CaptureEnd::TimedOut => {
                         send_error(
                             &mut stream,
-                            error_codes::PROTOCOL_VIOLATION,
-                            format!("unexpected {kind:?} during capture"),
+                            error_codes::TIMEOUT,
+                            "maximum capture duration exceeded",
                         );
+                        return Ok(());
+                    }
+                    CaptureEnd::ProtocolViolation(reason) => {
+                        send_error(&mut stream, error_codes::PROTOCOL_VIOLATION, reason);
                         return Ok(());
                     }
                 }
             }
-            Message::StopCapture(_) => {
-                send_error(
-                    &mut stream,
-                    error_codes::NO_ACTIVE_CAPTURE,
-                    "no capture is active",
-                );
+            Message::StopCapture(stop) => {
+                if validate_run_id(&stop.run_id).is_err() {
+                    send_error(
+                        &mut stream,
+                        error_codes::INVALID_REQUEST,
+                        "invalid StopCapture run_id",
+                    );
+                } else {
+                    send_error(
+                        &mut stream,
+                        error_codes::NO_ACTIVE_CAPTURE,
+                        "no capture is active",
+                    );
+                }
             }
             other => {
                 send_error(
@@ -426,7 +676,8 @@ enum CaptureEnd {
         samples_sent: u64,
     },
     Disconnected,
-    ProtocolViolation(wattch_protocol::frame::FrameKind),
+    TimedOut,
+    ProtocolViolation(String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -436,16 +687,16 @@ fn run_capture(
     identity: &DaemonIdentity,
     run_id: &str,
     interval: Duration,
-    selected: &[u32],
+    selected: &BTreeSet<u32>,
     session_start: Instant,
     sequence_numbers: &mut BTreeMap<u32, u64>,
     batch_sequence_no: &mut u64,
+    max_capture_duration: Duration,
 ) -> Result<CaptureEnd, WireError> {
     let stop_flag = AtomicBool::new(false);
-    // Tracked outside the producer closure so a mid-capture write error or
-    // panic can't discard counts for batches that were already sent: the
-    // ack must report what actually went out, regardless of how the
-    // producer thread exited.
+    // Tracked outside the producer closure so a normal StopCapture ack reports
+    // only batches whose writes completed. Producer failure tears down the
+    // connection instead of emitting a misleading partial acknowledgement.
     let batches_sent_counter = AtomicU64::new(0);
     let samples_sent_counter = AtomicU64::new(0);
     let mut writer = stream.try_clone()?;
@@ -453,65 +704,94 @@ fn run_capture(
 
     thread::scope(|scope| {
         let producer = scope.spawn(|| -> Result<(), WireError> {
-            loop {
-                if stop_flag.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-
-                let monotonic_ns = session_start.elapsed().as_nanos() as u64;
-                let readings = backend.sample();
-                let samples: Vec<RawSample> = readings
-                    .into_iter()
-                    .filter(|(id, _)| selected.contains(id))
-                    .map(|(source_id, value)| {
-                        let next = sequence_numbers.entry(source_id).or_insert(0);
-                        let sequence_no = *next;
-                        *next += 1;
-                        RawSample {
-                            source_id,
-                            sequence_no,
-                            monotonic_ns,
-                            value,
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<(), WireError> {
+                    loop {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            return Ok(());
                         }
-                    })
-                    .collect();
 
-                let batch = RawSampleBatch {
-                    run_id: run_id.to_string(),
-                    node_id: identity.node_id.clone(),
-                    batch_sequence_no: *batch_sequence_no,
-                    samples,
-                };
-                *batch_sequence_no += 1;
-                samples_sent_counter.fetch_add(batch.samples.len() as u64, Ordering::SeqCst);
-                batches_sent_counter.fetch_add(1, Ordering::SeqCst);
-                write_message(&mut writer, &Message::RawSampleBatch(batch))?;
+                        let monotonic_ns = session_start.elapsed().as_nanos() as u64;
+                        let readings = backend.sample();
+                        let samples: Vec<RawSample> = readings
+                            .into_iter()
+                            .filter(|(id, _)| selected.contains(id))
+                            .map(|(source_id, value)| {
+                                let next = sequence_numbers.entry(source_id).or_insert(0);
+                                let sequence_no = *next;
+                                *next += 1;
+                                RawSample {
+                                    source_id,
+                                    sequence_no,
+                                    monotonic_ns,
+                                    value,
+                                }
+                            })
+                            .collect();
 
-                // Sleep in small slices so StopCapture latency stays low
-                // even with long sampling intervals.
-                let mut remaining = interval;
-                while !remaining.is_zero() {
-                    if stop_flag.load(Ordering::SeqCst) {
-                        return Ok(());
+                        let sample_count = samples.len() as u64;
+                        let batch = RawSampleBatch {
+                            run_id: run_id.to_string(),
+                            node_id: identity.node_id.clone(),
+                            batch_sequence_no: *batch_sequence_no,
+                            samples,
+                        };
+                        *batch_sequence_no += 1;
+                        if let Err(err) =
+                            write_message(&mut writer, &Message::RawSampleBatch(batch))
+                        {
+                            let _ = writer.shutdown(Shutdown::Both);
+                            return Err(err);
+                        }
+                        samples_sent_counter.fetch_add(sample_count, Ordering::SeqCst);
+                        batches_sent_counter.fetch_add(1, Ordering::SeqCst);
+
+                        // Sleep in small slices so StopCapture latency stays low
+                        // even with long sampling intervals.
+                        let mut remaining = interval;
+                        while !remaining.is_zero() {
+                            if stop_flag.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            let slice = remaining.min(Duration::from_millis(20));
+                            thread::sleep(slice);
+                            remaining -= slice;
+                        }
                     }
-                    let slice = remaining.min(Duration::from_millis(20));
-                    thread::sleep(slice);
-                    remaining -= slice;
+                },
+            ));
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = writer.shutdown(Shutdown::Both);
+                    Err(WireError::Io(io::Error::other(
+                        "capture producer thread panicked",
+                    )))
                 }
             }
         });
 
-        let end = match read_message(&mut reader) {
-            Ok(Message::StopCapture(_)) => None,
-            Ok(other) => Some(CaptureEnd::ProtocolViolation(other.kind())),
+        let end = match read_message_before(&mut reader, max_capture_duration) {
+            Ok(Message::StopCapture(stop)) if validate_run_id(&stop.run_id).is_err() => Some(
+                CaptureEnd::ProtocolViolation("invalid StopCapture run_id".to_string()),
+            ),
+            Ok(Message::StopCapture(stop)) if stop.run_id == run_id => None,
+            Ok(Message::StopCapture(_)) => Some(CaptureEnd::ProtocolViolation(
+                "StopCapture run_id does not match the active run".to_string(),
+            )),
+            Ok(other) => Some(CaptureEnd::ProtocolViolation(format!(
+                "unexpected {:?} during capture",
+                other.kind()
+            ))),
+            Err(err) if is_timeout(&err) => Some(CaptureEnd::TimedOut),
             Err(_) => Some(CaptureEnd::Disconnected),
         };
         stop_flag.store(true, Ordering::SeqCst);
 
-        // The producer's own Ok/Err/panic outcome is intentionally not
-        // propagated here (unchanged from before); only how the counts are
-        // obtained has changed, so they survive a mid-capture failure.
-        let _ = producer.join();
+        let producer_result = producer
+            .join()
+            .map_err(|_| WireError::Io(io::Error::other("capture producer thread panicked")))?;
+        producer_result?;
         let batches_sent = batches_sent_counter.load(Ordering::SeqCst);
         let samples_sent = samples_sent_counter.load(Ordering::SeqCst);
 
@@ -523,6 +803,40 @@ fn run_capture(
             },
         })
     })
+}
+
+fn is_timeout(error: &WireError) -> bool {
+    matches!(
+        error,
+        WireError::Io(source)
+            if matches!(source.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    )
+}
+
+struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "read deadline exceeded",
+            ));
+        };
+        self.stream
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        self.stream.read(buffer)
+    }
+}
+
+fn read_message_before(stream: &mut UnixStream, timeout: Duration) -> Result<Message, WireError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| WireError::Io(io::Error::other("read deadline is too large")))?;
+    read_message(&mut DeadlineReader { stream, deadline })
 }
 
 fn compatible_version(client_version: &str) -> bool {
@@ -654,6 +968,7 @@ mod permission_tests {
                 socket: SocketSource::Bind(socket_path.clone()),
                 identity: identity(),
                 peer_policy: PeerPolicy::with_grants(&[], &[]),
+                limits: Default::default(),
             },
             || Box::new(NoopBackend::new()),
         )
@@ -685,6 +1000,7 @@ mod permission_tests {
                 socket: SocketSource::Bind(socket_path),
                 identity: identity(),
                 peer_policy: PeerPolicy::with_grants(&[], &[]),
+                limits: Default::default(),
             },
             || Box::new(NoopBackend::new()),
         );

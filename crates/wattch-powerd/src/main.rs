@@ -23,7 +23,8 @@ struct Args {
     ///
     /// Defaults to (in order of preference): /run/wattch/wattch-powerd.sock
     /// when running as root, $XDG_RUNTIME_DIR/wattch/wattch-powerd.sock, or
-    /// a per-uid path under /tmp. See docs/powerd.md for the full model.
+    /// a per-uid path under /tmp. Clients only auto-discover the first two;
+    /// pass --socket explicitly when using /tmp. See docs/powerd.md.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -136,6 +137,7 @@ fn main() -> Result<()> {
                 node_id: args.node_id.clone(),
             },
             peer_policy: PeerPolicy::with_grants(&args.allow_uid, &args.allow_gid),
+            limits: Default::default(),
         },
         move || make_backend(),
     )

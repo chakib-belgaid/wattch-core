@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import socket
 import struct
+import time
 from enum import IntEnum
 
 from .errors import WattchConnectionError, WattchProtocolError
@@ -67,10 +68,17 @@ def decode_header(buf: bytes) -> tuple[FrameKind, int, int]:
     return kind, flags, payload_len
 
 
-def _recv_exact(sock: socket.socket, length: int) -> bytes:
+def _recv_exact(
+    sock: socket.socket, length: int, deadline: float | None = None
+) -> bytes:
     chunks = []
     remaining = length
     while remaining > 0:
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise WattchConnectionError("socket read deadline exceeded")
+            sock.settimeout(max(timeout, 0.001))
         try:
             chunk = sock.recv(remaining)
         except OSError as exc:
@@ -83,10 +91,18 @@ def _recv_exact(sock: socket.socket, length: int) -> bytes:
 
 
 def read_frame(sock: socket.socket) -> tuple[FrameKind, bytes]:
-    header = _recv_exact(sock, HEADER_LEN)
-    kind, _flags, payload_len = decode_header(header)
-    payload = _recv_exact(sock, payload_len) if payload_len else b""
-    return kind, payload
+    original_timeout = sock.gettimeout()
+    deadline = (
+        None if original_timeout is None else time.monotonic() + original_timeout
+    )
+    try:
+        header = _recv_exact(sock, HEADER_LEN, deadline)
+        kind, _flags, payload_len = decode_header(header)
+        payload = _recv_exact(sock, payload_len, deadline) if payload_len else b""
+        return kind, payload
+    finally:
+        if sock.fileno() >= 0:
+            sock.settimeout(original_timeout)
 
 
 def write_frame(sock: socket.socket, kind: FrameKind, payload: bytes, flags: int = 0) -> None:

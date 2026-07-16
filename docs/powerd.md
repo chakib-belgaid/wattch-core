@@ -29,9 +29,8 @@ useful in containers that bind-mount powercap somewhere else).
 
 ## Socket path
 
-`--socket` overrides everything below and behaves exactly as before. When
-omitted, `wattch-powerd`, `wattch-testd`, `wattch` (the CLI), and `pywattch`
-all resolve the same default, in priority order:
+`--socket` overrides everything below. When omitted, a daemon chooses a bind
+path in this order:
 
 ```text
 1. /run/wattch/<name>                      when running as root (or, for
@@ -44,13 +43,16 @@ all resolve the same default, in priority order:
 ```
 
 `<name>` is `wattch-powerd.sock` for the powermeter daemon and
-`wattch-testd.sock` for the deterministic test daemon. A client (`wattch`,
-`pywattch`) probes the same three paths in order and connects to the first
-one that exists. When none exist and the default was used, both clients
-report the paths they tried in the connection error.
+`wattch-testd.sock` for the deterministic test daemon. Automatic client
+discovery (`wattch`, `pywattch`) probes only `/run/wattch` and
+`$XDG_RUNTIME_DIR`: it deliberately never probes `/tmp`. An existence check
+cannot authenticate a Unix socket in an attacker-writable directory. A
+development socket under `/tmp` remains supported only when its path is
+explicitly supplied to both daemon and client.
 
 ```bash
-# Development (any OS): binds under $XDG_RUNTIME_DIR or a per-uid /tmp path.
+# Development with a private XDG runtime directory: auto-discovery works.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
 wattch-powerd --backend synthetic
 
 # Linux with RAPL, running as root: binds /run/wattch/wattch-powerd.sock.
@@ -58,6 +60,7 @@ sudo wattch-powerd --backend linux-rapl
 
 # Explicit path always wins, on either side:
 wattch-powerd --backend synthetic --socket /tmp/wattch-powerd.sock
+wattch sources --socket /tmp/wattch-powerd.sock
 ```
 
 Check it from the unprivileged side:
@@ -66,6 +69,26 @@ Check it from the unprivileged side:
 wattch sources     # auto-detects the socket above
 wattch capture --out runs --duration-ms 2000
 ```
+
+## Bounded sessions
+
+The daemon treats every local client as untrusted even after peer credential
+authorization. Defaults are intentionally finite:
+
+```text
+connections                  64 global / 16 per uid on Linux
+active captures               8 global /  2 per uid on Linux
+Hello deadline                5 seconds
+idle session deadline         5 minutes
+maximum capture duration     24 hours
+socket write deadline         5 seconds
+minimum sampling interval    10 milliseconds
+```
+
+Invalid or amplifying capture requests are rejected before backend work. Run
+ids are non-empty and at most 256 UTF-8 bytes; source selections are unique;
+sampling below 10 ms is rejected. The systemd unit adds independent task and
+file-descriptor ceilings as defense in depth.
 
 ## Privilege model
 

@@ -100,8 +100,24 @@ Error codes:
 4   CAPTURE_ALREADY_ACTIVE
 5   NO_ACTIVE_CAPTURE
 6   ACCESS_DENIED
+7   INVALID_REQUEST
+8   RESOURCE_EXHAUSTED
+9   TIMEOUT
 100 INTERNAL
 ```
+
+Control-plane bounds in v0.1:
+
+```text
+run_id                     non-empty, no control characters, max 256 UTF-8 bytes
+interval_ms                at least 10 for the default daemon policy
+source_ids                 unique and no larger than the advertised source set
+one connection             one active capture at a time
+```
+
+Daemon implementations bound connections, active captures, handshake and
+idle reads, capture lifetime, and writes. A limit failure is explicit rather
+than silently clamping a request.
 
 ## Privilege model
 
@@ -185,6 +201,25 @@ No units.
 No backend names.
 No aggregation.
 No benchmark semantics.
+
+## Raw stream integrity
+
+Clients and artifact readers bind every batch to the capture established by
+the control plane:
+
+```text
+batch run_id equals the acknowledged run_id
+batch node_id equals HelloResponse.node_id
+each source_id is advertised and appears at most once per batch
+batch and per-source sequence numbers always move forward
+per-source monotonic timestamps never regress
+StopCaptureAck identity and counts equal the stream actually observed
+```
+
+Forward sequence gaps remain valid raw evidence and are reported as quality
+signals. Replay, reordering, metadata substitution, and cross-run trace
+splicing are integrity failures. `sources.json` must exactly match the source
+descriptors embedded in `manifest.json` before an artifact is inspected.
 
 ## Temporality
 

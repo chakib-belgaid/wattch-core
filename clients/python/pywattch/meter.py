@@ -102,6 +102,7 @@ class _Marker:
     wall_s: float
     cumulative: dict[int, float]
     monotonic_ns: int
+    instant_joules: dict[int, float]
 
 
 class EnergyMeter:
@@ -141,7 +142,8 @@ class EnergyMeter:
         self._sources: dict[int, SourceDescriptor] = {}
         self._latest: dict[int, float] = {}
         self._latest_ns: int = 0
-        self._instant_points: dict[int, list[tuple[int, float]]] = {}
+        self._instant_last: dict[int, tuple[int, float]] = {}
+        self._instant_joules: dict[int, float] = {}
         self._markers: list[_Marker] = []
         self._trace: EnergyTrace | None = None
         self._run_id = ""
@@ -156,18 +158,25 @@ class EnergyMeter:
         self._stop_requested.clear()
         self._first_batch.clear()
         self._reader_error = None
+        self._stop_ack = None
+        self._latest = {}
+        self._latest_ns = 0
         self._run_id = f"pywattch-meter-{time.time_ns()}"
 
         self._client = WattchClient(self.socket_path, client_name="pywattch-meter")
-        self._sources = {
-            s.local_source_id: s for s in self._client.sources
-        }
-        self._instant_points = {
-            sid: []
-            for sid, s in self._sources.items()
-            if s.temporality == "INSTANT" and s.unit == "WATT"
-        }
-        self._client.start_capture(self._run_id, self.interval_ms, self.source_ids)
+        try:
+            self._sources = {s.local_source_id: s for s in self._client.sources}
+            self._instant_last = {}
+            self._instant_joules = {
+                sid: 0.0
+                for sid, s in self._sources.items()
+                if s.temporality == "INSTANT" and s.unit == "WATT"
+            }
+            self._client.start_capture(self._run_id, self.interval_ms, self.source_ids)
+        except BaseException:
+            self._client.close()
+            self._client = None
+            raise
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -195,6 +204,13 @@ class EnergyMeter:
         self._stop_requested.set()
         if self._reader is not None:
             self._reader.join(timeout=10)
+            if self._reader.is_alive():
+                self._client.close()
+                self._reader.join(timeout=1)
+                if self._reader_error is None:
+                    self._reader_error = WattchError(
+                        "capture reader did not stop before the deadline"
+                    )
         self._client.close()
         self._client = None
         self._reader = None
@@ -247,6 +263,7 @@ class EnergyMeter:
                     wall_s=time.perf_counter(),
                     cumulative=dict(self._latest),
                     monotonic_ns=self._latest_ns,
+                    instant_joules=dict(self._instant_joules),
                 )
             )
 
@@ -269,19 +286,32 @@ class EnergyMeter:
                 self._ingest(message)
                 self._first_batch.set()
         except Exception as exc:  # surfaced on stop()
-            if not self._stop_requested.is_set():
-                self._reader_error = exc
+            self._reader_error = exc
             self._first_batch.set()
 
     def _ingest(self, batch: RawSampleBatch) -> None:
         with self._lock:
             for sample in batch.samples:
+                if sample.source_id not in self._sources:
+                    raise WattchError(
+                        f"daemon sent sample for unknown source id {sample.source_id}"
+                    )
                 value = sample.numeric_value
                 self._latest[sample.source_id] = value
                 self._latest_ns = max(self._latest_ns, sample.monotonic_ns)
-                if sample.source_id in self._instant_points:
-                    self._instant_points[sample.source_id].append(
-                        (sample.monotonic_ns, value)
+                if sample.source_id in self._instant_joules:
+                    previous = self._instant_last.get(sample.source_id)
+                    if previous is not None:
+                        previous_ns, previous_watts = previous
+                        self._instant_joules[sample.source_id] += (
+                            (previous_watts + value)
+                            / 2.0
+                            * (sample.monotonic_ns - previous_ns)
+                            / 1e9
+                        )
+                    self._instant_last[sample.source_id] = (
+                        sample.monotonic_ns,
+                        value,
                     )
 
     def _build_trace(self) -> EnergyTrace:
@@ -302,13 +332,12 @@ class EnergyMeter:
                 energy[descriptor.source_path] = delta * scale
 
             estimated: dict[str, float] = {}
-            for source_id, points in self._instant_points.items():
+            for source_id in self._instant_joules:
                 descriptor = self._sources[source_id]
-                window = [
-                    p for p in points if begin.monotonic_ns <= p[0] <= end.monotonic_ns
-                ]
-                if len(window) >= 2:
-                    estimated[descriptor.source_path] = trapezoidal_joules(window)
+                begin_joules = begin.instant_joules.get(source_id, 0.0)
+                end_joules = end.instant_joules.get(source_id, begin_joules)
+                if end_joules > begin_joules:
+                    estimated[descriptor.source_path] = end_joules - begin_joules
 
             samples.append(
                 EnergySample(

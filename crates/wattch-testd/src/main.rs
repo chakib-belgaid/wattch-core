@@ -15,7 +15,8 @@ struct Args {
     ///
     /// Defaults to (in order of preference): /run/wattch/wattch-testd.sock
     /// when running as root, $XDG_RUNTIME_DIR/wattch/wattch-testd.sock, or a
-    /// per-uid path under /tmp.
+    /// per-uid path under /tmp. Clients only auto-discover the first two;
+    /// pass --socket explicitly when using /tmp.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -73,6 +74,7 @@ fn main() -> Result<()> {
             socket: SocketSource::Bind(socket_path),
             identity,
             peer_policy: PeerPolicy::with_grants(&args.allow_uid, &args.allow_gid),
+            limits: Default::default(),
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
     )

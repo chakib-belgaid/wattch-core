@@ -1,10 +1,10 @@
 """Tests for the default Wattch daemon socket-path resolution.
 
-Mirrors the Rust resolution order in wattch_protocol::socket: prefer the
-root-owned runtime directory, then $XDG_RUNTIME_DIR, then a per-uid /tmp
-fallback. Fine-grained RAPL counters are a documented side channel
-(PLATYPUS, CVE-2020-8694), so a stale/predictable /tmp default is the bug
-being fixed here.
+Mirrors the Rust resolution order in wattch_protocol::socket: automatic
+discovery uses only the root-owned runtime directory and $XDG_RUNTIME_DIR.
+Fine-grained RAPL counters are a documented side channel (PLATYPUS,
+CVE-2020-8694), so predictable sockets in attacker-writable /tmp require an
+explicit path and are never auto-discovered.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def test_first_existing_falls_back_to_first_candidate_when_none_exist():
     assert _first_existing(["a", "b", "c"], exists=lambda _p: False) == "a"
 
 
-def test_default_socket_candidates_order_is_run_then_xdg_then_tmp(monkeypatch, tmp_path):
+def test_default_socket_candidates_use_only_trusted_runtime_dirs(monkeypatch, tmp_path):
     xdg = tmp_path / "run-user-501"
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     monkeypatch.setattr(os, "geteuid", lambda: 501)
@@ -45,7 +45,6 @@ def test_default_socket_candidates_order_is_run_then_xdg_then_tmp(monkeypatch, t
     assert candidates == [
         RUN_WATTCH_SOCKET,
         str(xdg / "wattch" / "wattch-powerd.sock"),
-        "/tmp/wattch-powerd-501.sock",
     ]
 
 
@@ -55,7 +54,7 @@ def test_default_socket_candidates_skips_xdg_when_unset(monkeypatch):
 
     candidates = default_socket_candidates()
 
-    assert candidates == [RUN_WATTCH_SOCKET, "/tmp/wattch-powerd-501.sock"]
+    assert candidates == [RUN_WATTCH_SOCKET]
 
 
 def test_default_socket_candidates_skips_xdg_when_empty(monkeypatch):
@@ -64,7 +63,7 @@ def test_default_socket_candidates_skips_xdg_when_empty(monkeypatch):
 
     candidates = default_socket_candidates()
 
-    assert candidates == [RUN_WATTCH_SOCKET, "/tmp/wattch-powerd-501.sock"]
+    assert candidates == [RUN_WATTCH_SOCKET]
 
 
 def test_default_socket_path_prefers_existing_xdg_socket(monkeypatch, tmp_path):
@@ -87,7 +86,7 @@ def test_default_socket_path_falls_back_to_first_candidate_when_none_exist(
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     monkeypatch.setattr(os, "geteuid", lambda: 999999)
 
-    # None of the three candidates exist in a throwaway tmp_path/uid, so the
+    # Neither trusted candidate exists in a throwaway runtime directory, so the
     # highest-priority candidate is returned anyway -- the caller (WattchClient
     # connect) is responsible for surfacing a WattchConnectionError that
     # includes this path.

@@ -95,7 +95,7 @@ pub enum WireError {
 }
 
 pub fn encode_frame(kind: FrameKind, flags: u16, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
-    if payload.len() > u32::MAX as usize {
+    if payload.len() > MAX_PAYLOAD_LEN as usize {
         return Err(FrameError::PayloadTooLarge(payload.len()));
     }
 
@@ -238,6 +238,15 @@ mod tests {
         assert!(matches!(
             read_frame(&mut Cursor::new(frame)),
             Err(WireError::Frame(FrameError::PayloadTooLarge(_)))
+        ));
+    }
+
+    #[test]
+    fn encode_frame_rejects_payload_above_wire_limit() {
+        let payload = vec![0u8; MAX_PAYLOAD_LEN as usize + 1];
+        assert!(matches!(
+            encode_frame(FrameKind::RawSampleBatch, 0, &payload),
+            Err(FrameError::PayloadTooLarge(length)) if length == payload.len()
         ));
     }
 

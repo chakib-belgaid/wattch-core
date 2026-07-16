@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use wattch_core::{RawSampleBatch, SourceDescriptor};
 
+/// Run ids are repeated in every data-plane batch, so keep the field small
+/// enough that a control-plane request cannot amplify capture memory/traffic.
+pub const MAX_RUN_ID_BYTES: usize = 256;
+
+pub fn validate_run_id(run_id: &str) -> Result<(), &'static str> {
+    if run_id.trim().is_empty() {
+        return Err("run_id must not be empty");
+    }
+    if run_id.len() > MAX_RUN_ID_BYTES {
+        return Err("run_id exceeds 256 UTF-8 bytes");
+    }
+    if run_id.chars().any(char::is_control) {
+        return Err("run_id must not contain control characters");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HelloRequest {
     pub client_name: String,
@@ -64,6 +81,9 @@ pub mod error_codes {
     pub const CAPTURE_ALREADY_ACTIVE: u32 = 4;
     pub const NO_ACTIVE_CAPTURE: u32 = 5;
     pub const ACCESS_DENIED: u32 = 6;
+    pub const INVALID_REQUEST: u32 = 7;
+    pub const RESOURCE_EXHAUSTED: u32 = 8;
+    pub const TIMEOUT: u32 = 9;
     pub const INTERNAL: u32 = 100;
 }
 
@@ -233,5 +253,13 @@ mod tests {
     fn rejects_malformed_payload() {
         let err = decode_message(FrameKind::HelloRequest, b"not-json").unwrap_err();
         assert!(matches!(err, WireError::InvalidPayload { .. }));
+    }
+
+    #[test]
+    fn run_id_validation_is_bounded() {
+        assert!(validate_run_id("run-1").is_ok());
+        assert!(validate_run_id("").is_err());
+        assert!(validate_run_id(&"x".repeat(MAX_RUN_ID_BYTES + 1)).is_err());
+        assert!(validate_run_id("run\n1").is_err());
     }
 }

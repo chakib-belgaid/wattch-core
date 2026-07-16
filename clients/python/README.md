@@ -44,9 +44,19 @@ Extras:
 Start one of the Wattch daemons first:
 
 ```bash
-wattch-powerd --backend synthetic       # dev
+# Private runtime directory: EnergyMeter() auto-discovers this socket.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
+wattch-powerd --backend synthetic
+
+# Explicit development path (including /tmp): pass it to both sides.
+wattch-powerd --backend synthetic --socket /tmp/wattch-powerd.sock
+# EnergyMeter(socket_path="/tmp/wattch-powerd.sock")
+
 sudo wattch-powerd --backend linux-rapl # Linux RAPL
 ```
+
+Automatic discovery never probes `/tmp`: an existence check cannot
+authenticate a Unix socket in an attacker-writable directory.
 
 ## Semantics
 
@@ -54,7 +64,8 @@ sudo wattch-powerd --backend linux-rapl # Linux RAPL
 - Cumulative counters (RAPL-style) become wrap-corrected joule deltas —
   these are the `energy` values.
 - Instant power sources (watts) are integrated trapezoidally and reported
-  separately as `estimated_energy`.
+  separately as `estimated_energy`. Integration is streaming: meter memory
+  remains constant as capture duration grows.
 
 ## Development
 

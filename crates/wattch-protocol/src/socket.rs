@@ -7,12 +7,16 @@
 //! module centralizes where that socket lives so `wattch-powerd`,
 //! `wattch-testd`, and `wattch-cli` agree without duplicating the logic.
 //!
-//! Resolution order (highest to lowest privilege):
+//! Resolution order for automatic client discovery (highest to lowest
+//! privilege):
 //! 1. `/run/wattch/<name>` — root-owned runtime directory (systemd
 //!    `RuntimeDirectory=wattch`, mode 0750; socket mode 0660 after bind).
 //! 2. `$XDG_RUNTIME_DIR/wattch/<name>` — user-private runtime directory.
-//! 3. `/tmp/<stem>-<uid>.sock` — per-uid fallback so unrelated local users
-//!    can't collide on (or squat) a shared, predictable `/tmp` path.
+//!
+//! A non-root daemon may still *bind* a per-uid `/tmp` path when no private
+//! runtime directory exists, but clients never auto-discover it. `/tmp` is
+//! attacker-writable and existence checks do not authenticate a Unix socket;
+//! development clients must opt in with an explicit `--socket` path.
 
 use std::env;
 use std::path::PathBuf;
@@ -36,11 +40,7 @@ pub fn default_bind_path(name: &str) -> PathBuf {
 /// should connect to the first one that exists and error out listing all of
 /// them if none do.
 pub fn default_connect_candidates(name: &str) -> Vec<PathBuf> {
-    connect_candidates_for(
-        name,
-        Uid::effective().as_raw(),
-        xdg_runtime_dir().as_deref(),
-    )
+    connect_candidates_for(name, xdg_runtime_dir().as_deref())
 }
 
 fn xdg_runtime_dir() -> Option<String> {
@@ -73,12 +73,11 @@ fn bind_path_for(name: &str, euid: u32, xdg: Option<&str>) -> PathBuf {
     PathBuf::from(TMP_DIR).join(per_uid_tmp_name(name, euid))
 }
 
-fn connect_candidates_for(name: &str, euid: u32, xdg: Option<&str>) -> Vec<PathBuf> {
+fn connect_candidates_for(name: &str, xdg: Option<&str>) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from(RUN_WATTCH_DIR).join(name)];
     if let Some(dir) = xdg {
         candidates.push(PathBuf::from(dir).join("wattch").join(name));
     }
-    candidates.push(PathBuf::from(TMP_DIR).join(per_uid_tmp_name(name, euid)));
     candidates
 }
 
@@ -136,27 +135,23 @@ mod tests {
     }
 
     #[test]
-    fn connect_candidates_root_then_xdg_then_tmp_in_order() {
-        let candidates = connect_candidates_for("wattch-powerd.sock", 501, Some("/run/user/501"));
+    fn connect_candidates_use_only_trusted_runtime_directories() {
+        let candidates = connect_candidates_for("wattch-powerd.sock", Some("/run/user/501"));
         assert_eq!(
             candidates,
             vec![
                 PathBuf::from("/run/wattch/wattch-powerd.sock"),
                 PathBuf::from("/run/user/501/wattch/wattch-powerd.sock"),
-                PathBuf::from("/tmp/wattch-powerd-501.sock"),
             ]
         );
     }
 
     #[test]
     fn connect_candidates_without_xdg_skips_that_entry() {
-        let candidates = connect_candidates_for("wattch-powerd.sock", 501, None);
+        let candidates = connect_candidates_for("wattch-powerd.sock", None);
         assert_eq!(
             candidates,
-            vec![
-                PathBuf::from("/run/wattch/wattch-powerd.sock"),
-                PathBuf::from("/tmp/wattch-powerd-501.sock"),
-            ]
+            vec![PathBuf::from("/run/wattch/wattch-powerd.sock")]
         );
     }
 
@@ -194,11 +189,7 @@ mod tests {
     #[test]
     fn default_connect_candidates_matches_current_process_euid() {
         let name = "wattch-smoke-test.sock";
-        let expected = connect_candidates_for(
-            name,
-            Uid::effective().as_raw(),
-            xdg_runtime_dir().as_deref(),
-        );
+        let expected = connect_candidates_for(name, xdg_runtime_dir().as_deref());
         assert_eq!(default_connect_candidates(name), expected);
     }
 }

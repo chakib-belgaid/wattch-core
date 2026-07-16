@@ -45,6 +45,7 @@ fn serves_example_scenario_over_socket() {
                 node_id,
             },
             peer_policy: PeerPolicy::with_grants(&[], &[]),
+            limits: Default::default(),
         },
         move || Box::new(DeterministicBackend::new(&scenario)),
     )
@@ -75,7 +76,7 @@ fn serves_example_scenario_over_socket() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "serve-test-run".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![],
         }),
     )

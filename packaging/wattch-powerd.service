@@ -49,14 +49,24 @@ User=root
 # -----------------------------------------------------------------------------
 Restart=on-failure
 RestartSec=2
+TasksMax=128
+LimitNOFILE=256
 
 # Hardening: the daemon is dumb on purpose — it reads counters and serves a
 # local socket, nothing else.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
 NoNewPrivileges=true
 ReadOnlyPaths=/sys/class/powercap
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

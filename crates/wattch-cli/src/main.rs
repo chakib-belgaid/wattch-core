@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wattch_cli::artifact::{inspect_run, RunWriter};
 use wattch_cli::client::WattchClient;
-use wattch_core::{validate_batch, validate_source_set, RunManifest, SourceDescriptor};
+use wattch_core::{validate_source_set, RunManifest, SourceDescriptor};
 use wattch_protocol::PROTOCOL_VERSION;
 
 #[derive(Debug, Parser)]
@@ -23,9 +23,10 @@ enum Command {
     /// List sources exposed by a daemon.
     Sources {
         /// Unix socket to connect to. When omitted, the first existing of
-        /// /run/wattch/wattch-powerd.sock, $XDG_RUNTIME_DIR/wattch/wattch-powerd.sock,
-        /// then a per-uid /tmp path is used; the command fails listing the
-        /// paths it tried if none exist.
+        /// /run/wattch/wattch-powerd.sock or
+        /// $XDG_RUNTIME_DIR/wattch/wattch-powerd.sock is used. Paths under
+        /// /tmp require an explicit --socket because they are not trusted for
+        /// automatic discovery.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -131,10 +132,7 @@ fn main() -> Result<()> {
                     if capture_error.is_some() {
                         return;
                     }
-                    if let Err(err) = validate_batch(&batch, &hello.sources) {
-                        capture_error =
-                            Some(anyhow::Error::new(err).context("daemon sent an invalid batch"));
-                    } else if let Err(err) = writer.append_batch(&batch) {
+                    if let Err(err) = writer.append_batch(&batch) {
                         capture_error = Some(err.into());
                     }
                 },

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,9 +9,10 @@ use wattch_core::{
     EvidenceClass, RawValue, SamplingMode, SourceDescriptor, SourceKind, Temporality, Unit,
 };
 use wattch_daemon::{
-    spawn, DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, ServerHandle, SocketSource,
+    spawn, DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, ServerHandle, ServerLimits,
+    SocketSource,
 };
-use wattch_protocol::frame::{write_frame, FrameKind};
+use wattch_protocol::frame::{write_frame, FrameKind, WireError};
 use wattch_protocol::messages::{
     error_codes, read_message, write_message, HelloRequest, Message, StartCapture, StopCapture,
 };
@@ -69,6 +71,10 @@ impl SampleBackend for CountingBackend {
 }
 
 fn start_server(name: &str) -> (ServerHandle, PathBuf) {
+    start_server_with_limits(name, ServerLimits::default())
+}
+
+fn start_server_with_limits(name: &str, limits: ServerLimits) -> (ServerHandle, PathBuf) {
     let socket_path = std::env::temp_dir().join(format!(
         "wattch-daemon-test-{name}-{}.sock",
         std::process::id()
@@ -83,11 +89,190 @@ fn start_server(name: &str) -> (ServerHandle, PathBuf) {
                 node_id: "node-test".to_string(),
             },
             peer_policy: PeerPolicy::with_grants(&[], &[]),
+            limits,
         },
         || Box::new(CountingBackend::new()),
     )
     .expect("server should start");
     (handle, socket_path)
+}
+
+#[test]
+fn rejects_amplifying_capture_requests_without_killing_session() {
+    let (handle, socket_path) = start_server("bounded-requests");
+    let mut stream = UnixStream::connect(&socket_path).unwrap();
+    hello(&mut stream);
+
+    let invalid = [
+        StartCapture {
+            run_id: String::new(),
+            interval_ms: 10,
+            source_ids: vec![],
+        },
+        StartCapture {
+            run_id: "x".repeat(257),
+            interval_ms: 10,
+            source_ids: vec![],
+        },
+        StartCapture {
+            run_id: "too-fast".to_string(),
+            interval_ms: 1,
+            source_ids: vec![],
+        },
+        StartCapture {
+            run_id: "duplicates".to_string(),
+            interval_ms: 10,
+            source_ids: vec![1, 1],
+        },
+    ];
+    for request in invalid {
+        write_message(&mut stream, &Message::StartCapture(request)).unwrap();
+        match read_message(&mut stream).unwrap() {
+            Message::Error(error) => assert_eq!(error.code, error_codes::INVALID_REQUEST),
+            other => panic!("expected INVALID_REQUEST, got {other:?}"),
+        }
+    }
+
+    write_message(
+        &mut stream,
+        &Message::StartCapture(StartCapture {
+            run_id: "valid-after-errors".to_string(),
+            interval_ms: 10,
+            source_ids: vec![1],
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_message(&mut stream).unwrap(),
+        Message::StartCaptureAck(_)
+    ));
+    write_message(
+        &mut stream,
+        &Message::StopCapture(StopCapture {
+            run_id: "valid-after-errors".to_string(),
+        }),
+    )
+    .unwrap();
+    loop {
+        if matches!(
+            read_message(&mut stream).unwrap(),
+            Message::StopCaptureAck(_)
+        ) {
+            break;
+        }
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn handshake_and_idle_reads_have_deadlines() {
+    let limits = ServerLimits {
+        hello_timeout: Duration::from_millis(40),
+        session_idle_timeout: Duration::from_millis(40),
+        ..Default::default()
+    };
+    let (handle, socket_path) = start_server_with_limits("read-deadlines", limits);
+
+    let mut silent = UnixStream::connect(&socket_path).unwrap();
+    silent
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    match read_message(&mut silent).unwrap() {
+        Message::Error(error) => assert_eq!(error.code, error_codes::TIMEOUT),
+        other => panic!("expected handshake TIMEOUT, got {other:?}"),
+    }
+
+    let mut trickle = UnixStream::connect(&socket_path).unwrap();
+    trickle
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    trickle.write_all(b"W").unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    match read_message(&mut trickle).unwrap() {
+        Message::Error(error) => assert_eq!(error.code, error_codes::TIMEOUT),
+        other => panic!("expected partial-frame TIMEOUT, got {other:?}"),
+    }
+
+    let mut idle = UnixStream::connect(&socket_path).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    hello(&mut idle);
+    match read_message(&mut idle).unwrap() {
+        Message::Error(error) => assert_eq!(error.code, error_codes::TIMEOUT),
+        other => panic!("expected idle TIMEOUT, got {other:?}"),
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn global_connection_limit_rejects_excess_sessions() {
+    let limits = ServerLimits {
+        max_connections: 1,
+        max_connections_per_uid: 1,
+        ..Default::default()
+    };
+    let (handle, socket_path) = start_server_with_limits("connection-limit", limits);
+    let mut first = UnixStream::connect(&socket_path).unwrap();
+    hello(&mut first);
+
+    let mut second = UnixStream::connect(&socket_path).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    match read_message(&mut second).unwrap() {
+        Message::Error(error) => assert_eq!(error.code, error_codes::RESOURCE_EXHAUSTED),
+        other => panic!("expected RESOURCE_EXHAUSTED, got {other:?}"),
+    }
+    drop(first);
+    handle.shutdown();
+}
+
+#[test]
+fn active_capture_limit_and_max_duration_are_enforced() {
+    let limits = ServerLimits {
+        max_active_captures: 1,
+        max_active_captures_per_uid: 1,
+        max_capture_duration: Duration::from_millis(80),
+        ..Default::default()
+    };
+    let (handle, socket_path) = start_server_with_limits("capture-limit", limits);
+    let mut first = UnixStream::connect(&socket_path).unwrap();
+    let mut second = UnixStream::connect(&socket_path).unwrap();
+    hello(&mut first);
+    hello(&mut second);
+
+    let start = |run_id: &str| {
+        Message::StartCapture(StartCapture {
+            run_id: run_id.to_string(),
+            interval_ms: 10,
+            source_ids: vec![],
+        })
+    };
+    write_message(&mut first, &start("held-capture")).unwrap();
+    assert!(matches!(
+        read_message(&mut first).unwrap(),
+        Message::StartCaptureAck(_)
+    ));
+
+    write_message(&mut second, &start("rejected-capture")).unwrap();
+    match read_message(&mut second).unwrap() {
+        Message::Error(error) => assert_eq!(error.code, error_codes::RESOURCE_EXHAUSTED),
+        other => panic!("expected RESOURCE_EXHAUSTED, got {other:?}"),
+    }
+
+    first
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    loop {
+        match read_message(&mut first).unwrap() {
+            Message::RawSampleBatch(_) => {}
+            Message::Error(error) => {
+                assert_eq!(error.code, error_codes::TIMEOUT);
+                break;
+            }
+            other => panic!("expected batch or TIMEOUT, got {other:?}"),
+        }
+    }
+    handle.shutdown();
 }
 
 fn hello(stream: &mut UnixStream) -> Message {
@@ -131,7 +316,7 @@ fn capture_streams_monotonic_batches_then_acks_stop() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "run-test".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![],
         }),
     )
@@ -192,7 +377,7 @@ fn capture_streams_monotonic_batches_then_acks_stop() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "run-test-2".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![1],
         }),
     )
@@ -222,7 +407,7 @@ fn unknown_source_id_is_rejected_without_killing_session() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "run-bad".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![99],
         }),
     )
@@ -238,7 +423,7 @@ fn unknown_source_id_is_rejected_without_killing_session() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "run-good".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![1],
         }),
     )
@@ -336,7 +521,7 @@ impl SampleBackend for FlakyBackend {
 }
 
 #[test]
-fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
+fn producer_panic_closes_capture_instead_of_leaving_reader_blocked() {
     let panicked = Arc::new(AtomicBool::new(false));
     let panic_after: u32 = 3;
 
@@ -356,6 +541,7 @@ fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
                 node_id: "node-test".to_string(),
             },
             peer_policy: PeerPolicy::with_grants(&[], &[]),
+            limits: Default::default(),
         },
         move || {
             Box::new(FlakyBackend {
@@ -378,7 +564,7 @@ fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
         &mut stream,
         &Message::StartCapture(StartCapture {
             run_id: "run-panic".to_string(),
-            interval_ms: 5,
+            interval_ms: 10,
             source_ids: vec![],
         }),
     )
@@ -398,33 +584,18 @@ fn stop_capture_ack_reports_counts_sent_before_producer_panics() {
         }
     }
 
-    // Wait until the producer has actually panicked on its next sample()
-    // call, so the StopCapture below is guaranteed to race a dead producer
-    // rather than a live one still mid-batch.
+    // Wait until the producer has actually panicked on its next sample().
     let deadline = Instant::now() + Duration::from_secs(5);
     while !panicked.load(Ordering::SeqCst) {
         assert!(Instant::now() < deadline, "producer never panicked");
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    write_message(
-        &mut stream,
-        &Message::StopCapture(StopCapture {
-            run_id: "run-panic".to_string(),
-        }),
-    )
-    .unwrap();
-
-    let ack = match read_message(&mut stream).unwrap() {
-        Message::StopCaptureAck(ack) => ack,
-        other => panic!("expected StopCaptureAck, got {other:?}"),
-    };
-
-    assert_eq!(
-        ack.batches_sent, panic_after as u64,
-        "counts must reflect batches actually sent, not be zeroed out by the producer panic"
+    assert!(
+        matches!(read_message(&mut stream), Err(WireError::ConnectionClosed)),
+        "a failed producer must tear down the session without waiting for StopCapture"
     );
-    assert_eq!(ack.samples_sent, panic_after as u64 * 2);
+    assert_eq!(batches.len(), panic_after as usize);
 
     handle.shutdown();
 }
@@ -473,6 +644,7 @@ fn activated_listener_serves_and_socket_survives_shutdown() {
                 node_id: "node-test".to_string(),
             },
             peer_policy: PeerPolicy::with_grants(&[], &[]),
+            limits: Default::default(),
         },
         || Box::new(CountingBackend::new()),
     )
@@ -519,6 +691,7 @@ fn deny_all_policy_rejects_with_access_denied() {
                 allowed_uids: vec![],
                 allowed_gids: vec![],
             },
+            limits: Default::default(),
         },
         || Box::new(CountingBackend::new()),
     )

@@ -18,4 +18,7 @@ pub enum Error {
 
     #[error("invalid sample: {0}")]
     InvalidSample(String),
+
+    #[error("invalid raw sample batch: {0}")]
+    InvalidBatch(String),
 }
