@@ -302,6 +302,48 @@ def _parse_wrapper(stdout: bytes) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _skill_invocation_observed(transcript: bytes) -> bool:
+    """Recognize an explicit skill-use statement from agent-authored messages only."""
+
+    for raw_line in transcript.splitlines():
+        try:
+            event = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and "wattch-energy-optimize" in text.casefold():
+            return True
+    return False
+
+
+def _agent_environment(
+    *, state_path: Path, checkout: Path
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Keep tool-generated caches outside the candidate-only mutation boundary."""
+
+    cache_root = (state_path.resolve().parent / "agent-cache").resolve()
+    if _inside(cache_root, checkout):
+        raise ValueError("agent cache must be outside the measured checkout")
+    cache_paths = {
+        "root": str(cache_root),
+        "cargo_target_dir": str(cache_root / "cargo-target"),
+        "python_pycache_prefix": str(cache_root / "python-pycache"),
+    }
+    for path in cache_paths.values():
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONPYCACHEPREFIX"] = cache_paths["python_pycache_prefix"]
+    environment["CARGO_TARGET_DIR"] = cache_paths["cargo_target_dir"]
+    return environment, cache_paths
+
+
 def _labels(manifest: dict[str, Any], *, stage: str, extra: dict[str, str]) -> list[str]:
     condition = manifest["condition"]
     labels = {
@@ -406,8 +448,10 @@ def run_agent(args: argparse.Namespace) -> dict[str, object]:
     )
     if prompt_text.encode("utf-8") != Path(state["checkout"]).joinpath(PROMPT_REL).read_bytes():
         raise AssertionError("agent prompt argument lost bytes")
-    environment = os.environ.copy()
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment, cache_paths = _agent_environment(
+        state_path=args.state,
+        checkout=Path(state["checkout"]),
+    )
     started = time.perf_counter()
     completed = subprocess.run(command, capture_output=True, check=False, env=environment)
     wrapper_duration_s = time.perf_counter() - started
@@ -425,7 +469,7 @@ def run_agent(args: argparse.Namespace) -> dict[str, object]:
             "files": _artifact_hashes(run_dir),
         }
     scope = verify_mutation(state)
-    skill_observed = b"wattch-energy-optimize" in transcript
+    skill_observed = _skill_invocation_observed(transcript)
     treatment_gate = (
         skill_observed if state["condition"]["skill_enabled"] else not skill_observed
     )
@@ -439,6 +483,7 @@ def run_agent(args: argparse.Namespace) -> dict[str, object]:
         "wrapper_stdout_sha256": sha256_bytes(completed.stdout),
         "wrapper_stderr_sha256": sha256_bytes(completed.stderr),
         "wrapper_duration_s": wrapper_duration_s,
+        "isolated_cache": cache_paths,
         "wrapper": wrapper,
         "artifact": agent_artifact,
         "mutation_scope": scope,

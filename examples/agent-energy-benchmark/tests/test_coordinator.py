@@ -134,6 +134,69 @@ class CoordinatorTest(unittest.TestCase):
         self.assertLess(command.index("-a"), command.index("exec"))
         self.assertGreater(command.index("--ignore-user-config"), command.index("exec"))
 
+    def test_skill_detection_ignores_command_output_and_requires_agent_message(
+        self,
+    ) -> None:
+        command_output = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "aggregated_output": "read .agents/skills/wattch-energy-optimize/SKILL.md",
+                },
+            }
+        ).encode()
+        agent_message = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "I am using the wattch-energy-optimize skill for this task.",
+                },
+            }
+        ).encode()
+        self.assertFalse(
+            coordinator._skill_invocation_observed(b"not-json\n" + command_output)
+        )
+        self.assertTrue(
+            coordinator._skill_invocation_observed(command_output + b"\n" + agent_message)
+        )
+
+    def test_agent_environment_redirects_cargo_and_python_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            state = root / "results" / "state.json"
+            environment, cache_paths = coordinator._agent_environment(
+                state_path=state,
+                checkout=checkout,
+            )
+
+            cache_root = Path(cache_paths["root"])
+            self.assertFalse(coordinator._inside(cache_root, checkout))
+            self.assertEqual(environment["CARGO_TARGET_DIR"], cache_paths["cargo_target_dir"])
+            self.assertEqual(
+                environment["PYTHONPYCACHEPREFIX"],
+                cache_paths["python_pycache_prefix"],
+            )
+            self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
+            self.assertTrue(Path(cache_paths["cargo_target_dir"]).is_dir())
+            self.assertTrue(Path(cache_paths["python_pycache_prefix"]).is_dir())
+
+            source = checkout / "probe.py"
+            source.write_text("VALUE = 1\n", "utf-8")
+            subprocess.run(
+                [sys.executable, "-m", "py_compile", str(source)],
+                check=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertFalse((checkout / "__pycache__").exists())
+            self.assertTrue(
+                any(Path(cache_paths["python_pycache_prefix"]).rglob("probe.*.pyc"))
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
