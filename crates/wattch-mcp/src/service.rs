@@ -8,7 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wattch_cli::artifact::{inspect_run, read_manifest, read_sources, replay_events, replay_trace};
 use wattch_cli::client::WattchClient;
@@ -131,6 +131,7 @@ struct ServiceState {
     next_capture: u64,
     shutting_down: bool,
     active: BTreeMap<String, CaptureControl>,
+    finishing: BTreeMap<String, String>,
     completed: BTreeMap<String, Result<Value, ServiceError>>,
     completed_order: VecDeque<String>,
 }
@@ -138,6 +139,7 @@ struct ServiceState {
 pub struct WattchService {
     config: ServiceConfig,
     state: Mutex<ServiceState>,
+    state_changed: Condvar,
 }
 
 impl WattchService {
@@ -145,6 +147,7 @@ impl WattchService {
         Ok(Self {
             config: config.resolve()?,
             state: Mutex::new(ServiceState::default()),
+            state_changed: Condvar::new(),
         })
     }
 
@@ -191,9 +194,10 @@ impl WattchService {
             ));
         }
         validate_labels(&args.labels)?;
+        if let Some(run_id) = args.run_id.as_deref() {
+            validate_run_component(run_id)?;
+        }
 
-        let out_root = self.resolve_output_root(args.out.as_deref())?;
-        let socket = self.resolve_socket()?;
         let (capture_id, run_dir, ready) = {
             let mut state = self.lock_state();
             reap_finished_locked(&mut state);
@@ -203,7 +207,15 @@ impl WattchService {
                     "MCP capture service is shutting down",
                 ));
             }
-            if state.active.len() >= self.config.max_active_captures {
+            if let Some(run_id) = args.run_id.as_deref() {
+                if run_id_reserved(&state, run_id) {
+                    return Err(ServiceError::new(
+                        "CAPTURE_EXISTS",
+                        format!("run {run_id:?} is already active"),
+                    ));
+                }
+            }
+            if reserved_capture_count(&state) >= self.config.max_active_captures {
                 return Err(ServiceError::new(
                     "CAPTURE_LIMIT",
                     format!(
@@ -212,11 +224,16 @@ impl WattchService {
                     ),
                 ));
             }
+            // Resolve the daemon and artifact root only after admission. This
+            // keeps lifecycle errors deterministic while a capture still owns
+            // a service slot and run-id reservation.
+            let out_root = self.resolve_output_root(args.out.as_deref())?;
+            let socket = self.resolve_socket()?;
             state.next_capture = state.next_capture.saturating_add(1);
             let capture_id = minted_capture_id(state.next_capture);
             let run_id = args.run_id.unwrap_or_else(|| format!("mcp-{capture_id}"));
             validate_run_component(&run_id)?;
-            if state.active.values().any(|active| active.run_id == run_id) {
+            if run_id_reserved(&state, &run_id) {
                 return Err(ServiceError::new(
                     "CAPTURE_EXISTS",
                     format!("run {run_id:?} is already active"),
@@ -275,15 +292,33 @@ impl WattchService {
             if let Some(result) = take_completed_locked(&mut state, &args.capture_id) {
                 return result;
             }
-            state.active.remove(&args.capture_id).ok_or_else(|| {
+            if state.finishing.contains_key(&args.capture_id) {
+                return Err(ServiceError::new(
+                    "CAPTURE_STOP_IN_PROGRESS",
+                    format!("capture {:?} is already stopping", args.capture_id),
+                ));
+            }
+            let control = state.active.remove(&args.capture_id).ok_or_else(|| {
                 ServiceError::new(
                     "CAPTURE_NOT_FOUND",
                     format!("unknown active capture_id {:?}", args.capture_id),
                 )
-            })?
+            })?;
+            state
+                .finishing
+                .insert(args.capture_id.clone(), control.run_id.clone());
+            control
         };
         let _ = control.stop.send(());
-        join_control(&mut control)
+        let result = join_control(&mut control);
+        let mut state = self.lock_state();
+        let reservation = state.finishing.remove(&args.capture_id);
+        debug_assert!(
+            reservation.is_some(),
+            "stopping capture keeps its reservation"
+        );
+        self.state_changed.notify_all();
+        result
     }
 
     pub fn inspect(&self, arguments: Value) -> Result<Value, ServiceError> {
@@ -357,7 +392,13 @@ impl WattchService {
             let mut state = self.lock_state();
             reap_finished_locked(&mut state);
             state.shutting_down = true;
-            std::mem::take(&mut state.active)
+            let controls = std::mem::take(&mut state.active);
+            for (capture_id, control) in &controls {
+                state
+                    .finishing
+                    .insert(capture_id.clone(), control.run_id.clone());
+            }
+            controls
         };
         for control in controls.values() {
             let _ = control.stop.send(());
@@ -368,7 +409,15 @@ impl WattchService {
             .collect::<Vec<_>>();
         let mut state = self.lock_state();
         for (capture_id, result) in completed {
+            state.finishing.remove(&capture_id);
             cache_completed_locked(&mut state, capture_id, result);
+        }
+        self.state_changed.notify_all();
+        while !state.finishing.is_empty() {
+            state = self
+                .state_changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
@@ -504,17 +553,25 @@ impl WattchService {
     }
 
     fn remove_and_join(&self, capture_id: &str, request_stop: bool) {
-        let control = {
+        let mut control = {
             let mut state = self.lock_state();
             let control = state.active.remove(capture_id);
             let _ = take_completed_locked(&mut state, capture_id);
+            if let Some(control) = &control {
+                state
+                    .finishing
+                    .insert(capture_id.to_string(), control.run_id.clone());
+            }
             control
         };
-        if let Some(mut control) = control {
+        if let Some(control) = &mut control {
             if request_stop {
                 let _ = control.stop.send(());
             }
-            let _ = join_control(&mut control);
+            let _ = join_control(control);
+            let mut state = self.lock_state();
+            state.finishing.remove(capture_id);
+            self.state_changed.notify_all();
         }
     }
 
@@ -552,6 +609,18 @@ fn reap_finished_locked(state: &mut ServiceState) {
             cache_completed_locked(state, capture_id, result);
         }
     }
+}
+
+fn reserved_capture_count(state: &ServiceState) -> usize {
+    state.active.len().saturating_add(state.finishing.len())
+}
+
+fn run_id_reserved(state: &ServiceState, run_id: &str) -> bool {
+    state.active.values().any(|active| active.run_id == run_id)
+        || state
+            .finishing
+            .values()
+            .any(|finishing_run_id| finishing_run_id == run_id)
 }
 
 fn cache_completed_locked(
@@ -1091,6 +1160,7 @@ fn evidence_warnings(sources: &[SourceDescriptor], daemon_name: &str) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
     use wattch_cli::artifact::RunWriter;
     use wattch_core::{EvidenceClass, RunManifest, SamplingMode, SourceKind, Temporality, Unit};
 
@@ -1162,6 +1232,206 @@ mod tests {
         assert!(validate_run_component("agent-luna-skill-r01").is_ok());
         assert!(validate_run_component("../escape").is_err());
         assert!(validate_run_component("nested/run").is_err());
+    }
+
+    #[test]
+    fn stopping_capture_keeps_slot_and_run_id_reserved_until_join_finishes() {
+        let root = std::env::temp_dir().join(format!(
+            "wattch-mcp-stopping-reservation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let service = Arc::new(WattchService::new(config(&root)).unwrap());
+
+        let capture_id = "capture-under-stop";
+        let run_id = "run-under-stop";
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (stop_observed_tx, stop_observed_rx) = mpsc::sync_channel(0);
+        let (release_join_tx, release_join_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            stop_rx.recv().unwrap();
+            stop_observed_tx.send(()).unwrap();
+            let _ = release_join_rx.recv();
+            Ok(json!({"status": "stopped"}))
+        });
+        {
+            let mut state = service.lock_state();
+            state.active.insert(
+                capture_id.to_string(),
+                CaptureControl {
+                    run_id: run_id.to_string(),
+                    stop: stop_tx,
+                    join: Some(join),
+                },
+            );
+        }
+
+        let stop_service = Arc::clone(&service);
+        let stopper = std::thread::spawn(move || {
+            stop_service.capture_stop(json!({"capture_id": capture_id}))
+        });
+        stop_observed_rx.recv().unwrap();
+
+        {
+            let state = service.lock_state();
+            assert!(state.active.is_empty());
+            assert_eq!(
+                state.finishing.get(capture_id).map(String::as_str),
+                Some(run_id)
+            );
+            assert_eq!(reserved_capture_count(&state), 1);
+        }
+        assert_eq!(
+            service
+                .capture_start(json!({"run_id": run_id, "interval_ms": 20}))
+                .unwrap_err()
+                .code,
+            "CAPTURE_EXISTS"
+        );
+        assert_eq!(
+            service
+                .capture_start(json!({
+                    "run_id": "different-run",
+                    "interval_ms": 20
+                }))
+                .unwrap_err()
+                .code,
+            "CAPTURE_LIMIT"
+        );
+
+        let shutdown_service = Arc::clone(&service);
+        let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            shutdown_service.shutdown_all();
+            shutdown_done_tx.send(()).unwrap();
+        });
+        while !service.lock_state().shutting_down {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            shutdown_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_join_tx.send(()).unwrap();
+        assert_eq!(stopper.join().unwrap().unwrap()["status"], "stopped");
+        shutdown_done_rx.recv().unwrap();
+        shutdown.join().unwrap();
+        {
+            let state = service.lock_state();
+            assert_eq!(reserved_capture_count(&state), 0);
+            assert!(!run_id_reserved(&state, run_id));
+        }
+
+        drop(service);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_cleanup_keeps_slot_and_run_id_reserved_until_join_finishes() {
+        let root = std::env::temp_dir().join(format!(
+            "wattch-mcp-startup-cleanup-reservation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let service = Arc::new(WattchService::new(config(&root)).unwrap());
+
+        let capture_id = "capture-under-startup-cleanup";
+        let run_id = "run-under-startup-cleanup";
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (stop_observed_tx, stop_observed_rx) = mpsc::sync_channel(0);
+        let (release_join_tx, release_join_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            stop_rx.recv().unwrap();
+            stop_observed_tx.send(()).unwrap();
+            let _ = release_join_rx.recv();
+            Err(ServiceError::new("STARTUP_FAILED", "expected test failure"))
+        });
+        {
+            let mut state = service.lock_state();
+            state.active.insert(
+                capture_id.to_string(),
+                CaptureControl {
+                    run_id: run_id.to_string(),
+                    stop: stop_tx,
+                    join: Some(join),
+                },
+            );
+        }
+
+        let cleanup_service = Arc::clone(&service);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_service.remove_and_join(capture_id, true);
+        });
+        stop_observed_rx.recv().unwrap();
+
+        {
+            let state = service.lock_state();
+            assert_eq!(
+                state.finishing.get(capture_id).map(String::as_str),
+                Some(run_id)
+            );
+            assert_eq!(reserved_capture_count(&state), 1);
+        }
+        assert_eq!(
+            service
+                .capture_start(json!({"run_id": run_id, "interval_ms": 20}))
+                .unwrap_err()
+                .code,
+            "CAPTURE_EXISTS"
+        );
+        assert_eq!(
+            service
+                .capture_start(json!({"run_id": "different-run", "interval_ms": 20}))
+                .unwrap_err()
+                .code,
+            "CAPTURE_LIMIT"
+        );
+
+        release_join_tx.send(()).unwrap();
+        cleanup.join().unwrap();
+        {
+            let state = service.lock_state();
+            assert_eq!(reserved_capture_count(&state), 0);
+            assert!(!run_id_reserved(&state, run_id));
+        }
+
+        drop(service);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_capture_results_are_bounded_and_retrieved_once() {
+        let mut state = ServiceState::default();
+        for index in 0..(MAX_COMPLETED_CAPTURES + 2) {
+            cache_completed_locked(
+                &mut state,
+                format!("capture-{index}"),
+                Ok(json!({"index": index})),
+            );
+        }
+
+        assert_eq!(state.completed.len(), MAX_COMPLETED_CAPTURES);
+        assert_eq!(state.completed_order.len(), MAX_COMPLETED_CAPTURES);
+        assert!(!state.completed.contains_key("capture-0"));
+        assert!(!state.completed.contains_key("capture-1"));
+        assert_eq!(
+            take_completed_locked(&mut state, "capture-2")
+                .unwrap()
+                .unwrap()["index"],
+            2
+        );
+        assert!(take_completed_locked(&mut state, "capture-2").is_none());
+        assert_eq!(state.completed.len(), MAX_COMPLETED_CAPTURES - 1);
+        assert_eq!(state.completed_order.len(), MAX_COMPLETED_CAPTURES - 1);
     }
 
     #[test]

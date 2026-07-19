@@ -251,6 +251,67 @@ fn summary(output: &Output) -> Value {
     serde_json::from_str(stdout.trim()).unwrap()
 }
 
+#[test]
+fn sources_json_is_one_stable_discovery_object_with_full_descriptors() {
+    let (_server, socket) = start_server("sources-json", BackendShape::Cumulative);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("sources")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result = summary(&output);
+    assert_eq!(
+        result
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "clock_instance_id".to_string(),
+            "daemon".to_string(),
+            "protocol_version".to_string(),
+            "sources".to_string(),
+        ])
+    );
+    assert_eq!(
+        result["daemon"],
+        serde_json::json!({
+            "name": "run-testd",
+            "version": "test",
+            "node_id": NODE_ID,
+        })
+    );
+    assert_eq!(
+        result["protocol_version"],
+        wattch_protocol::PROTOCOL_VERSION
+    );
+    assert!(result["clock_instance_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert_eq!(
+        result["sources"],
+        serde_json::to_value(descriptors(BackendShape::Cumulative)).unwrap()
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("sources")
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human_stdout = String::from_utf8(human.stdout).unwrap();
+    assert!(human_stdout.starts_with(&format!(
+        "daemon: run-testd test (node {NODE_ID})\nid   path"
+    )));
+    assert!(human_stdout.contains("cpu/package/0/energy"));
+}
+
 fn replayed_events(run_dir: &Path) -> Vec<wattch_protocol::messages::Event> {
     let mut events = Vec::new();
     replay_events(run_dir, |batch| events.extend(batch.events)).unwrap();
@@ -372,6 +433,86 @@ fn run_success_emits_clean_json_and_complete_artifact() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap()["state"].clone())
         .collect::<Vec<_>>();
     assert_eq!(states, vec!["STARTED", "COMPLETE"]);
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("inspect")
+        .arg("--run")
+        .arg(&run_dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspection = summary(&inspect);
+    assert_eq!(
+        inspection
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "batches".to_string(),
+            "command_lifecycle".to_string(),
+            "event_batches".to_string(),
+            "events".to_string(),
+            "node_id".to_string(),
+            "per_event_kind".to_string(),
+            "per_source".to_string(),
+            "run_id".to_string(),
+            "samples".to_string(),
+            "unknown_source_samples".to_string(),
+        ])
+    );
+    assert_eq!(inspection["run_id"], "run-success");
+    assert_eq!(inspection["node_id"], NODE_ID);
+    assert_eq!(inspection["batches"], result["batches"]);
+    assert_eq!(inspection["samples"], result["samples"]);
+    assert_eq!(inspection["event_batches"], 3);
+    assert_eq!(inspection["events"], 3);
+    assert_eq!(inspection["unknown_source_samples"], 0);
+    assert_eq!(
+        inspection["per_event_kind"],
+        serde_json::json!({
+            "TARGET_EXEC": 1,
+            "TARGET_EXIT": 1,
+            "TARGET_SPAWN": 1,
+        })
+    );
+    assert_eq!(
+        inspection["per_source"]["1"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "first_monotonic_ns".to_string(),
+            "first_sequence_no".to_string(),
+            "last_monotonic_ns".to_string(),
+            "last_sequence_no".to_string(),
+            "samples".to_string(),
+            "sequence_gaps".to_string(),
+        ])
+    );
+    assert_eq!(
+        inspection["command_lifecycle"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "batches".to_string(),
+            "exit_code".to_string(),
+            "reason".to_string(),
+            "samples".to_string(),
+            "signal".to_string(),
+            "status".to_string(),
+        ])
+    );
+    assert_eq!(inspection["command_lifecycle"]["status"], "COMPLETE");
+    assert_eq!(inspection["command_lifecycle"]["exit_code"], 0);
+    assert!(inspection["command_lifecycle"]["reason"].is_null());
 
     let _ = std::fs::remove_dir_all(out);
 }
@@ -496,6 +637,23 @@ fn spawn_failure_finishes_evidence_and_releases_the_daemon_session() {
     assert!(inspect.status.success());
     assert!(String::from_utf8_lossy(&inspect.stdout).contains("command lifecycle INCOMPLETE"));
 
+    let inspect_json = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("inspect")
+        .arg("--run")
+        .arg(&failed_dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(inspect_json.status.success());
+    let inspection = summary(&inspect_json);
+    assert_eq!(inspection["command_lifecycle"]["status"], "INCOMPLETE");
+    assert!(inspection["command_lifecycle"]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("failed to spawn command")));
+    assert!(inspection["command_lifecycle"]["exit_code"].is_null());
+    assert!(inspection["command_lifecycle"]["batches"].is_null());
+    assert!(inspection["command_lifecycle"]["samples"].is_null());
+
     let retry = run_cli(
         &socket,
         &out,
@@ -616,6 +774,60 @@ fn run_terminates_descendants_in_its_dedicated_process_group() {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(descendant_pid), None),
         Err(nix::errno::Errno::ESRCH)
     );
+
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
+fn run_timeout_terminates_the_target_group_and_finalizes_evidence() {
+    let (_server, socket) = start_server("target-timeout", BackendShape::Cumulative);
+    let out = output_root("target-timeout-out");
+    let script = "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & printf '%s' \"$!\"; while :; do sleep 1; done";
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--out")
+        .arg(&out)
+        .arg("--interval-ms")
+        .arg("10")
+        .arg("--timeout-ms")
+        .arg("100")
+        .arg("--run-id")
+        .arg("run-target-timeout")
+        .arg("--json")
+        .arg("--")
+        .args(["/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(137));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    let result = summary(&output);
+    assert_eq!(result["exit_code"], 137);
+    assert_eq!(result["signal"], 9);
+    let run_dir = PathBuf::from(result["run_dir"].as_str().unwrap());
+    let descendant_pid: i32 = std::fs::read_to_string(run_dir.join("target.stdout.log"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(descendant_pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+    let exit = &replayed_events(&run_dir)[2];
+    assert_eq!(
+        exit.labels.get("timed_out").map(String::as_str),
+        Some("true")
+    );
+    let lifecycle = inspect_run(&run_dir).unwrap().command_lifecycle.unwrap();
+    assert_eq!(lifecycle.status, CommandLifecycleStatus::Complete);
+    assert_eq!(lifecycle.exit_code, Some(137));
+    let command: Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("command.json")).unwrap())
+            .unwrap();
+    assert_eq!(command["timeout_ms"], 100);
 
     let _ = std::fs::remove_dir_all(out);
 }

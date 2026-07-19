@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +36,10 @@ enum Command {
         /// automatic discovery.
         #[arg(long)]
         socket: Option<PathBuf>,
+
+        /// Emit exactly one machine-readable discovery object on stdout.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Capture a raw trace artifact from a daemon.
@@ -71,6 +76,11 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
 
+        /// Bound target wall time. On expiry Wattch terminates the target's
+        /// dedicated process group, then finalizes the capture artifact.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+
         /// Explicit run id. Agent workflows should encode the trial condition.
         #[arg(long)]
         run_id: String,
@@ -92,6 +102,10 @@ enum Command {
     Inspect {
         #[arg(long)]
         run: PathBuf,
+
+        /// Emit exactly one machine-readable inspection object on stdout.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Validate source descriptors in a scenario or manifest file.
@@ -108,27 +122,43 @@ fn main() -> Result<ExitCode> {
         Command::Version => {
             println!("wattch protocol {PROTOCOL_VERSION}");
         }
-        Command::Sources { socket } => {
+        Command::Sources { socket, json } => {
             let socket = resolve_socket(socket)?;
             let client = WattchClient::connect(&socket)?;
             let hello = client.hello();
-            println!(
-                "daemon: {} {} (node {})",
-                hello.daemon_name, hello.daemon_version, hello.node_id
-            );
-            println!(
-                "{:<4} {:<40} {:<12} {:<12} kind",
-                "id", "path", "unit", "temporality"
-            );
-            for source in client.sources() {
+            if json {
                 println!(
-                    "{:<4} {:<40} {:<12} {:<12} {:?}",
-                    source.local_source_id,
-                    source.source_path,
-                    format!("{:?}", source.unit),
-                    format!("{:?}", source.temporality),
-                    source.kind
+                    "{}",
+                    serde_json::to_string(&SourcesJson {
+                        daemon: DaemonIdentityJson {
+                            name: &hello.daemon_name,
+                            version: &hello.daemon_version,
+                            node_id: &hello.node_id,
+                        },
+                        clock_instance_id: &hello.clock_instance_id,
+                        protocol_version: &hello.protocol_version,
+                        sources: &hello.sources,
+                    })?
                 );
+            } else {
+                println!(
+                    "daemon: {} {} (node {})",
+                    hello.daemon_name, hello.daemon_version, hello.node_id
+                );
+                println!(
+                    "{:<4} {:<40} {:<12} {:<12} kind",
+                    "id", "path", "unit", "temporality"
+                );
+                for source in client.sources() {
+                    println!(
+                        "{:<4} {:<40} {:<12} {:<12} {:?}",
+                        source.local_source_id,
+                        source.source_path,
+                        format!("{:?}", source.unit),
+                        format!("{:?}", source.temporality),
+                        source.kind
+                    );
+                }
             }
         }
         Command::Capture {
@@ -200,6 +230,7 @@ fn main() -> Result<ExitCode> {
             socket,
             out,
             interval_ms,
+            timeout_ms,
             run_id,
             labels,
             json,
@@ -210,6 +241,7 @@ fn main() -> Result<ExitCode> {
                 socket,
                 out,
                 interval_ms,
+                timeout: timeout_ms.map(Duration::from_millis),
                 run_id,
                 labels: labels_to_map(labels)?,
                 argv: program,
@@ -227,48 +259,52 @@ fn main() -> Result<ExitCode> {
             }
             return Ok(ExitCode::from(result.wrapper_exit_code()));
         }
-        Command::Inspect { run } => {
+        Command::Inspect { run, json } => {
             let report = inspect_run(&run)?;
-            println!("run: {} (node {})", report.run_id, report.node_id);
-            println!(
-                "batches: {}  samples: {}  event_batches: {}  events: {}",
-                report.batches, report.samples, report.event_batches, report.events
-            );
-            if let Some(lifecycle) = &report.command_lifecycle {
-                match lifecycle.status {
-                    CommandLifecycleStatus::Complete => println!(
-                        "command: COMPLETE  exit_code: {}  signal: {}",
-                        lifecycle.exit_code.unwrap_or(1),
-                        lifecycle
-                            .signal
-                            .map_or_else(|| "none".to_string(), |signal| signal.to_string())
-                    ),
-                    CommandLifecycleStatus::Incomplete => println!(
-                        "WARNING: command lifecycle INCOMPLETE: {}",
-                        lifecycle.reason.as_deref().unwrap_or("unspecified reason")
-                    ),
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                println!("run: {} (node {})", report.run_id, report.node_id);
+                println!(
+                    "batches: {}  samples: {}  event_batches: {}  events: {}",
+                    report.batches, report.samples, report.event_batches, report.events
+                );
+                if let Some(lifecycle) = &report.command_lifecycle {
+                    match lifecycle.status {
+                        CommandLifecycleStatus::Complete => println!(
+                            "command: COMPLETE  exit_code: {}  signal: {}",
+                            lifecycle.exit_code.unwrap_or(1),
+                            lifecycle
+                                .signal
+                                .map_or_else(|| "none".to_string(), |signal| signal.to_string())
+                        ),
+                        CommandLifecycleStatus::Incomplete => println!(
+                            "WARNING: command lifecycle INCOMPLETE: {}",
+                            lifecycle.reason.as_deref().unwrap_or("unspecified reason")
+                        ),
+                    }
                 }
-            }
-            if report.unknown_source_samples > 0 {
+                if report.unknown_source_samples > 0 {
+                    println!(
+                        "WARNING: {} samples reference unknown source ids",
+                        report.unknown_source_samples
+                    );
+                }
                 println!(
-                    "WARNING: {} samples reference unknown source ids",
-                    report.unknown_source_samples
+                    "{:<4} {:<10} {:<12} {:<12} {:<8} span_ms",
+                    "id", "samples", "first_seq", "last_seq", "gaps"
                 );
-            }
-            println!(
-                "{:<4} {:<10} {:<12} {:<12} {:<8} span_ms",
-                "id", "samples", "first_seq", "last_seq", "gaps"
-            );
-            for (source_id, stats) in &report.per_source {
-                println!(
-                    "{:<4} {:<10} {:<12} {:<12} {:<8} {:.1}",
-                    source_id,
-                    stats.samples,
-                    stats.first_sequence_no,
-                    stats.last_sequence_no,
-                    stats.sequence_gaps,
-                    (stats.last_monotonic_ns - stats.first_monotonic_ns) as f64 / 1e6
-                );
+                for (source_id, stats) in &report.per_source {
+                    println!(
+                        "{:<4} {:<10} {:<12} {:<12} {:<8} {:.1}",
+                        source_id,
+                        stats.samples,
+                        stats.first_sequence_no,
+                        stats.last_sequence_no,
+                        stats.sequence_gaps,
+                        (stats.last_monotonic_ns - stats.first_monotonic_ns) as f64 / 1e6
+                    );
+                }
             }
         }
         Command::Validate { input } => {
@@ -290,6 +326,21 @@ fn main() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct SourcesJson<'a> {
+    daemon: DaemonIdentityJson<'a>,
+    clock_instance_id: &'a str,
+    protocol_version: &'a str,
+    sources: &'a [SourceDescriptor],
+}
+
+#[derive(Serialize)]
+struct DaemonIdentityJson<'a> {
+    name: &'a str,
+    version: &'a str,
+    node_id: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,7 +371,7 @@ fn labels_to_map(labels: Vec<CliLabel>) -> Result<BTreeMap<String, String>> {
     for label in labels {
         if matches!(
             label.key.as_str(),
-            CLOCK_INSTANCE_ID_LABEL | "pid" | "returncode" | "signal"
+            CLOCK_INSTANCE_ID_LABEL | "pid" | "returncode" | "signal" | "timed_out"
         ) {
             bail!("--label key {:?} is reserved", label.key);
         }
@@ -461,6 +512,7 @@ mod tests {
         ];
         assert!(labels_to_map(duplicate).is_err());
         assert!(labels_to_map(vec!["pid=12".parse().unwrap()]).is_err());
+        assert!(labels_to_map(vec!["timed_out=true".parse().unwrap()]).is_err());
         assert!(
             labels_to_map(vec![format!("{CLOCK_INSTANCE_ID_LABEL}=clock")
                 .parse()

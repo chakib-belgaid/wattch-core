@@ -43,6 +43,7 @@ pub struct RunCommandOptions {
     pub socket: PathBuf,
     pub out: PathBuf,
     pub interval_ms: u64,
+    pub timeout: Option<Duration>,
     pub run_id: String,
     pub labels: BTreeMap<String, String>,
     pub argv: Vec<String>,
@@ -80,6 +81,7 @@ struct CommandMetadata<'a> {
     environment: EnvironmentMetadata,
     stdio: StdioMetadata,
     process_group: &'static str,
+    timeout_ms: Option<u128>,
     labels: &'a BTreeMap<String, String>,
 }
 
@@ -146,6 +148,7 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
             stderr: TARGET_STDERR_FILE,
         },
         process_group: "dedicated",
+        timeout_ms: options.timeout.map(|timeout| timeout.as_millis()),
         labels: &options.labels,
     };
     write_json_sidecar(writer.run_dir(), JsonSidecar::Command, &command_metadata)?;
@@ -249,13 +252,17 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
             return Err(finish_after_error(writer, &mut lifecycle, error));
         }
     };
+    let target = TargetContext {
+        run_id: &options.run_id,
+        labels: &options.labels,
+        timeout: options.timeout,
+    };
     let capture_result = capture_child(
         &mut session,
         &mut writer,
         &mut child,
         process_group_id,
-        &options.run_id,
-        &options.labels,
+        &target,
         tail_tracker,
     );
     let capture_result = match capture_result {
@@ -313,8 +320,16 @@ fn validate_options(options: &RunCommandOptions) -> Result<()> {
     if options.argv.iter().any(|argument| argument.contains('\0')) {
         bail!("command argv entries must not contain NUL bytes");
     }
-    if options.labels.contains_key(CLOCK_INSTANCE_ID_LABEL) {
-        bail!("--label key {CLOCK_INSTANCE_ID_LABEL:?} is reserved");
+    if let Some(key) = options.labels.keys().find(|key| {
+        matches!(
+            key.as_str(),
+            CLOCK_INSTANCE_ID_LABEL | "pid" | "returncode" | "signal" | "timed_out"
+        )
+    }) {
+        bail!("--label key {key:?} is reserved");
+    }
+    if options.timeout.is_some_and(|timeout| timeout.is_zero()) {
+        bail!("--timeout-ms must be greater than zero");
     }
 
     // Validate every augmented marker before creating files or connecting.
@@ -354,22 +369,27 @@ fn create_log(path: &Path) -> Result<File> {
         .with_context(|| format!("failed to create {}", path.display()))
 }
 
+struct TargetContext<'a> {
+    run_id: &'a str,
+    labels: &'a BTreeMap<String, String>,
+    timeout: Option<Duration>,
+}
+
 fn capture_child(
     session: &mut CaptureSession<'_>,
     writer: &mut RunWriter,
     child: &mut Child,
     process_group_id: i32,
-    run_id: &str,
-    labels: &BTreeMap<String, String>,
+    target: &TargetContext<'_>,
     mut tail_tracker: SampleBoundaryTracker,
 ) -> Result<(ExitStatus, StopCaptureAck)> {
     let pid = child.id().to_string();
     session
         .record_event(marker(
-            run_id,
+            target.run_id,
             "target-exec",
             TARGET_EXEC,
-            labels,
+            target.labels,
             &[("pid", &pid)],
         ))
         .context("failed to record TARGET_EXEC")?;
@@ -379,9 +399,31 @@ fn capture_child(
     let mut tail_deadline = None;
     let mut tail_error = None;
     let mut stop_deadline = None;
+    let target_deadline = target
+        .timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| anyhow!("target timeout is too large"))
+        })
+        .transpose()?;
+    let mut target_timed_out = false;
     loop {
         if status.is_none() {
             status = child.try_wait().context("failed to poll command status")?;
+            if status.is_none()
+                && target_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                target_timed_out = true;
+                terminate_process_group(child, process_group_id)
+                    .context("failed to terminate timed-out command process group")?;
+                status = child
+                    .try_wait()
+                    .context("failed to reap timed-out command")?;
+                if status.is_none() {
+                    bail!("timed-out command was terminated without a final status");
+                }
+            }
             if let Some(exit_status) = status.as_ref() {
                 terminate_process_group(child, process_group_id)
                     .context("failed to clean up command process group")?;
@@ -392,8 +434,17 @@ fn capture_child(
                 if let Some(signal_text) = signal_text.as_deref() {
                     extras.push(("signal", signal_text));
                 }
+                if target_timed_out {
+                    extras.push(("timed_out", "true"));
+                }
                 session
-                    .record_event(marker(run_id, "target-exit", TARGET_EXIT, labels, &extras))
+                    .record_event(marker(
+                        target.run_id,
+                        "target-exit",
+                        TARGET_EXIT,
+                        target.labels,
+                        &extras,
+                    ))
                     .context("failed to record TARGET_EXIT")?;
             }
         }

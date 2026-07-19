@@ -119,14 +119,15 @@ impl CommandLifecycleRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandLifecycleStatus {
     Complete,
     Incomplete,
 }
 
 /// Inspection result for a command-backed artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CommandLifecycleSummary {
     pub status: CommandLifecycleStatus,
     pub exit_code: Option<i32>,
@@ -654,7 +655,7 @@ fn is_legacy_v0_1(protocol_version: &str) -> bool {
     protocol_version == "0.1" || protocol_version.starts_with("0.1.")
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SourceStats {
     pub samples: u64,
     pub first_sequence_no: u64,
@@ -664,7 +665,7 @@ pub struct SourceStats {
     pub last_monotonic_ns: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct InspectReport {
     pub run_id: String,
     pub node_id: String,
