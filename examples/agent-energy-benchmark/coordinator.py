@@ -344,6 +344,14 @@ def _agent_environment(
     return environment, cache_paths
 
 
+def _agent_workflow_successful(
+    *, returncode: int, wrapper: object, mutation_scope_valid: object
+) -> bool:
+    """Apply only predeclared execution and mutation-scope eligibility gates."""
+
+    return returncode == 0 and isinstance(wrapper, dict) and mutation_scope_valid is True
+
+
 def _labels(manifest: dict[str, Any], *, stage: str, extra: dict[str, str]) -> list[str]:
     condition = manifest["condition"]
     labels = {
@@ -470,7 +478,7 @@ def run_agent(args: argparse.Namespace) -> dict[str, object]:
         }
     scope = verify_mutation(state)
     skill_observed = _skill_invocation_observed(transcript)
-    treatment_gate = (
+    adherence_observed = (
         skill_observed if state["condition"]["skill_enabled"] else not skill_observed
     )
     result: dict[str, object] = {
@@ -488,8 +496,14 @@ def run_agent(args: argparse.Namespace) -> dict[str, object]:
         "artifact": agent_artifact,
         "mutation_scope": scope,
         "skill_invocation_observed": skill_observed,
-        "treatment_gate_passed": treatment_gate,
-        "successful": completed.returncode == 0 and bool(wrapper) and scope["valid"] and treatment_gate,
+        "assignment_adherence_observed": adherence_observed,
+        # Skill installation is the assigned treatment. Invocation is an
+        # adherence observation, not a post-treatment exclusion criterion.
+        "successful": _agent_workflow_successful(
+            returncode=completed.returncode,
+            wrapper=wrapper,
+            mutation_scope_valid=scope["valid"],
+        ),
     }
     output = args.state.resolve().parent / f"{state['condition']['id']}-agent-result.json"
     write_new_json(output, result)
@@ -544,7 +558,7 @@ def run_trials(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("run-agent must complete before generated-code trials")
     agent_result = read_json_object(agent_result_path)
     if agent_result.get("successful") is not True:
-        raise ValueError("agent result did not pass execution, scope, and treatment gates")
+        raise ValueError("agent result did not pass execution and mutation-scope gates")
     scope_before = verify_mutation(state)
     if not scope_before["valid"] or scope_before["candidate_sha256"] is None:
         raise ValueError(f"unexpected checkout mutation before trials: {scope_before}")

@@ -31,7 +31,7 @@ from pywattch.analysis.replay import _read_trace  # noqa: E402
 
 DEFAULT_KIND_ORDER = ("CPU_PACKAGE_ENERGY", "PLATFORM_ENERGY", "CPU_POWER")
 MARKER_PAIRS = (
-    ("TARGET_EXEC", "TARGET_EXIT"),
+    ("TARGET_SPAWN", "TARGET_EXIT"),
     ("WATTCH_WINDOW_START", "WATTCH_WINDOW_END"),
 )
 

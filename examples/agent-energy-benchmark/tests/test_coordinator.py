@@ -197,6 +197,22 @@ class CoordinatorTest(unittest.TestCase):
                 any(Path(cache_paths["python_pycache_prefix"]).rglob("probe.*.pyc"))
             )
 
+    def test_agent_success_does_not_select_on_skill_adherence(self) -> None:
+        self.assertTrue(
+            coordinator._agent_workflow_successful(
+                returncode=0,
+                wrapper={"run_id": "valid"},
+                mutation_scope_valid=True,
+            )
+        )
+        self.assertFalse(
+            coordinator._agent_workflow_successful(
+                returncode=0,
+                wrapper={"run_id": "valid"},
+                mutation_scope_valid=False,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

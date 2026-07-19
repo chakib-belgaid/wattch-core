@@ -46,6 +46,11 @@ coordinator copies the frozen skill package only to treatment checkouts under
 `.agents/skills/wattch-energy-optimize`, snapshots every non-`.git` path, and
 rejects any post-agent change except `candidate.py`.
 
+Skill installation is the treatment assignment. An agent-authored declaration
+of skill use is retained as an adherence observation, but is not a
+post-treatment exclusion criterion. A missing declaration therefore remains a
+reportable treatment outcome instead of triggering a selective rerun.
+
 ```bash
 python3 examples/agent-energy-benchmark/coordinator.py prepare \
   --checkout /absolute/luna-control \
@@ -92,5 +97,7 @@ The summary deliberately refuses to call synthetic values physical evidence
 and never sums CPU, GPU, ANE, or nested RAPL domains. Physical-claim eligibility
 defaults to false and additionally requires a complete bound capture, exact
 correctness/useful work, accepted bound quality, calibration, and matching file
-hashes. A single run never enables a comparison claim, and no local run measures
-Luna or Terra inference in the provider datacenter.
+hashes. CLI outcomes use the acknowledged pre-launch `TARGET_SPAWN` through
+`TARGET_EXIT` window so fast children cannot run ahead of the start marker. A
+single run never enables a comparison claim, and no local run measures Luna or
+Terra inference in the provider datacenter.
