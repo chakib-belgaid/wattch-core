@@ -16,12 +16,7 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "clients" / "python"))
-sys.path.insert(
-    0,
-    str(REPO_ROOT / "skills" / "wattch-energy-optimize" / "scripts"),
-)
 
-from evidence_contract import qualify_run  # noqa: E402
 from pywattch._frames import FrameKind  # noqa: E402
 from pywattch._messages import SourceDescriptor  # noqa: E402
 from pywattch.analysis.boundary import MeasurementBoundary  # noqa: E402
@@ -34,6 +29,33 @@ MARKER_PAIRS = (
     ("TARGET_SPAWN", "TARGET_EXIT"),
     ("WATTCH_WINDOW_START", "WATTCH_WINDOW_END"),
 )
+
+
+def _qualify_run(run_dir: Path, *, source_uid: str, trial_record: Path | None):
+    """Load the optional skill qualifier only when an outcome is summarized."""
+
+    script_roots = (
+        REPO_ROOT / ".agents/skills/wattch-energy-optimize/scripts",
+        REPO_ROOT / "skills/wattch-energy-optimize/scripts",
+    )
+    for root in script_roots:
+        if root.is_dir():
+            sys.path.insert(0, str(root))
+            break
+    try:
+        from evidence_contract import qualify_run
+    except ModuleNotFoundError as error:
+        if error.name != "evidence_contract":
+            raise
+        raise SystemExit(
+            "Wattch evidence qualifier is unavailable; install the "
+            "wattch-energy-optimize skill or run from its source checkout"
+        ) from error
+    return qualify_run(
+        run_dir,
+        requested_source_uid=source_uid,
+        trial_record=trial_record,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,9 +135,9 @@ def main() -> None:
         end_monotonic_ns=end_ns,
         estimand=Estimand.EQUAL_WORK,
     )
-    qualification = qualify_run(
+    qualification = _qualify_run(
         run_dir,
-        requested_source_uid=source.source_uid,
+        source_uid=source.source_uid,
         trial_record=args.trial_record,
     )
     qualification["outcome_computable"] = True

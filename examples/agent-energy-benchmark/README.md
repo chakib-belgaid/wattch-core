@@ -93,6 +93,11 @@ python3 examples/agent-energy-benchmark/summarize_run.py \
   --trial-record /external/results/trials/<run-id>.json
 ```
 
+This operator-side helper loads the qualifier from either the installed
+`.agents` treatment package or a Wattch source checkout containing the packaged
+skill. Its marker-selection tests remain runnable in control checkouts without
+importing treatment-only code.
+
 The summary deliberately refuses to call synthetic values physical evidence
 and never sums CPU, GPU, ANE, or nested RAPL domains. Physical-claim eligibility
 defaults to false and additionally requires a complete bound capture, exact
