@@ -155,7 +155,9 @@ python3 examples/agent-energy-benchmark/physical_study.py preflight \
 ```
 
 Preflight requires exactly one 250 ms Apple CPU interval-average source and its
-canonical native-duration companion. The full run additionally requires a
+canonical native-duration companion. The plan polls the backend at 50 ms so a
+native frame is not lost when the tool's actual cadence is slightly slower than
+its requested 250 ms interval. The full run additionally requires a
 host-specific `METER_CALIBRATION` covering IDLE, FIXED_LOAD, and A/A regimes.
 Run preflight and the study from a macOS terminal context where `sandbox-exec`
 is permitted; a containing application sandbox may reject the nested profile.

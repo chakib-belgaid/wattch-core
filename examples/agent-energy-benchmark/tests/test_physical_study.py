@@ -425,6 +425,7 @@ class PhysicalStudyTest(unittest.TestCase):
             },
             "acquisition": {
                 "interval_ms": 100,
+                "poll_interval_ms": 50,
                 "minimum_target_duration_s": 1.0,
                 "minimum_selected_source_samples": 10,
                 "cooldown_s": 0.0,
@@ -437,6 +438,10 @@ class PhysicalStudyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ten native samples"):
             physical_study._validate_plan_bounds(plan)
         plan["acquisition"]["minimum_selected_source_samples"] = 10
+        plan["acquisition"]["poll_interval_ms"] = 60
+        with self.assertRaisesRegex(ValueError, "poll at least twice"):
+            physical_study._validate_plan_bounds(plan)
+        plan["acquisition"]["poll_interval_ms"] = 50
         plan["workload"]["target_timeout_ms"] = 1_000
         with self.assertRaisesRegex(ValueError, "timeout"):
             physical_study._validate_plan_bounds(plan)

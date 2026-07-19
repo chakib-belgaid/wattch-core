@@ -329,7 +329,7 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
             "--out",
             str(runs_root),
             "--interval-ms",
-            str(plan["acquisition"]["interval_ms"]),
+            str(plan["acquisition"]["poll_interval_ms"]),
             "--timeout-ms",
             str(args.timeout_ms),
             "--run-id",
@@ -367,12 +367,25 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
             or read_object(run_dir / "command.json").get("argv") != command
         ):
             raise ValueError(f"{observation_id} failed its exact workload gates")
-        analysis = _analyze_run(
-            run_dir,
-            source_uid=source_uid,
-            boundary=boundary,
-            expected_daemon=readiness["daemon"],
-        )
+        try:
+            analysis = _analyze_run(
+                run_dir,
+                source_uid=source_uid,
+                boundary=boundary,
+                expected_daemon=readiness["daemon"],
+            )
+        except Exception as error:
+            write_new(
+                observations_root / f"{observation_id}.failure.json",
+                {
+                    **item,
+                    "artifact_sha256": _artifact_hashes(run_dir),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "run_dir": str(run_dir),
+                },
+            )
+            raise
         if float(analysis["marker_duration_s"]) < minimum_duration_s:
             raise ValueError(f"{observation_id} is shorter than the calibrated window")
         selected_quality = analysis["source_quality"][source_uid]
@@ -416,6 +429,7 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
             "fixed_iterations": args.fixed_iterations,
             "idle_seconds": args.idle_seconds,
             "phase_fractions": list(args.phase_fractions),
+            "poll_interval_ms": plan["acquisition"]["poll_interval_ms"],
             "repetitions": args.repetitions,
             "schedule_seed": args.schedule_seed,
             "workload_seed": args.workload_seed,

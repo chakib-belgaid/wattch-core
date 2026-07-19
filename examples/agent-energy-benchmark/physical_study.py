@@ -68,6 +68,7 @@ WILLIAMS_ROWS = (
     (3, 0, 2, 1),
 )
 DEFAULT_INTERVAL_MS = 250
+DEFAULT_POLL_INTERVAL_MS = 50
 DEFAULT_ITERATIONS = 48
 DEFAULT_BLOCKS = 8
 DEFAULT_COOLDOWN_S = 5.0
@@ -426,6 +427,7 @@ def prepare_plan(args: argparse.Namespace) -> dict[str, object]:
             "temporality": "INTERVAL_AVERAGE",
             "evidence_class": "TOOL_DERIVED_ESTIMATE",
             "interval_ms": args.interval_ms,
+            "poll_interval_ms": args.poll_interval_ms,
             "minimum_target_duration_s": args.minimum_target_duration_s,
             "minimum_selected_source_samples": args.minimum_samples,
             "cooldown_s": args.cooldown_s,
@@ -465,16 +467,24 @@ def _validate_plan_bounds(plan: dict[str, Any]) -> None:
         raise ValueError("workload accounts must not exceed events")
 
     interval_ms = acquisition.get("interval_ms")
+    poll_interval_ms = acquisition.get("poll_interval_ms")
     minimum_samples = acquisition.get("minimum_selected_source_samples")
     if (
         isinstance(interval_ms, bool)
         or not isinstance(interval_ms, int)
         or interval_ms <= 0
+        or isinstance(poll_interval_ms, bool)
+        or not isinstance(poll_interval_ms, int)
+        or poll_interval_ms < 10
+        or poll_interval_ms * 2 > interval_ms
         or isinstance(minimum_samples, bool)
         or not isinstance(minimum_samples, int)
         or minimum_samples < 10
     ):
-        raise ValueError("acquisition must require at least ten native samples")
+        raise ValueError(
+            "acquisition must poll at least twice per native interval and "
+            "require at least ten native samples"
+        )
     minimum_duration = acquisition.get("minimum_target_duration_s")
     cooldown = acquisition.get("cooldown_s")
     if (
@@ -979,6 +989,7 @@ def _labels(
         "position": str(item["position"]),
         "execution_order": str(item["execution_order"]),
         "interval_ms": str(plan["acquisition"]["interval_ms"]),
+        "poll_interval_ms": str(plan["acquisition"]["poll_interval_ms"]),
         "measurement_overhead_calibration_sha256": calibration_sha256,
     }
     result: list[str] = []
@@ -1223,7 +1234,7 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
             "--out",
             str(runs_root),
             "--interval-ms",
-            str(plan["acquisition"]["interval_ms"]),
+            str(plan["acquisition"]["poll_interval_ms"]),
             "--timeout-ms",
             str(plan["workload"]["target_timeout_ms"]),
             "--run-id",
@@ -1615,6 +1626,9 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--blocks", type=int, default=DEFAULT_BLOCKS)
     prepare.add_argument("--schedule-seed", type=int, default=20260719)
     prepare.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
+    prepare.add_argument(
+        "--poll-interval-ms", type=int, default=DEFAULT_POLL_INTERVAL_MS
+    )
     prepare.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     prepare.add_argument("--minimum-target-duration-s", type=float, default=DEFAULT_MIN_DURATION_S)
     prepare.add_argument("--minimum-samples", type=int, default=DEFAULT_MIN_SAMPLES)
@@ -1646,6 +1660,7 @@ def main() -> None:
             args.iterations,
             args.target_timeout_ms,
             args.interval_ms,
+            args.poll_interval_ms,
             args.minimum_samples,
         ) <= 0:
             raise ValueError("workload and acquisition counts must be positive")
