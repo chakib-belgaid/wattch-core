@@ -36,6 +36,19 @@ class CandidateContractTest(unittest.TestCase):
         self.assertEqual(summary[1]["kind_values"]["read"], 9)
         self.assertEqual(summary[1]["rolling"], 4002045006104)
 
+    def test_summary_preserves_out_of_range_integer_kinds(self) -> None:
+        summary = candidate.summarize([(0, -1, 5), (0, 4, 7), (1, 0, 11)])
+        self.assertEqual(summary[0]["count"], 2)
+        self.assertEqual(
+            summary[0]["kind_counts"], dict.fromkeys(candidate.EVENT_KINDS, 0)
+        )
+        self.assertEqual(
+            summary[0]["kind_values"], dict.fromkeys(candidate.EVENT_KINDS, 0)
+        )
+        self.assertEqual(summary[0]["rolling"], 18446744072705552647)
+        self.assertEqual(summary[0]["total_value"], 12)
+        self.assertEqual(summary[1]["kind_counts"]["read"], 1)
+
     def test_cli_stdout_is_canonical(self) -> None:
         completed = subprocess.run(
             [

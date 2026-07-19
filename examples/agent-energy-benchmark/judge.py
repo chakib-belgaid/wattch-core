@@ -53,10 +53,11 @@ def reference_summary(events: list[tuple[int, int, int]]) -> list[dict[str, obje
                 "total_value": 0,
             }
             rows[account] = row
-        name = EVENT_KINDS[kind]
         row["count"] += 1
-        row["kind_counts"][name] += 1
-        row["kind_values"][name] += value
+        if 0 <= kind < len(EVENT_KINDS):
+            name = EVENT_KINDS[kind]
+            row["kind_counts"][name] += 1
+            row["kind_values"][name] += value
         row["rolling"] = (
             row["rolling"] * 1_000_003 + kind * 1_009 + value
         ) & MASK_64
@@ -234,6 +235,10 @@ def probe_candidate(path: Path, python: Path) -> dict[str, object]:
             failures.append(f"generate_events mismatch for {(count, accounts, seed)!r}")
         if module.summarize(expected) != reference_summary(expected):
             failures.append(f"summarize mismatch for {(count, accounts, seed)!r}")
+
+    kind_edge_events = [(0, -1, 5), (0, 4, 7), (1, 0, 11)]
+    if module.summarize(kind_edge_events) != reference_summary(kind_edge_events):
+        failures.append("summarize mismatch for out-of-range integer event kinds")
 
     sample = reference_summary(reference_events(37, 7, 91))
     encoded = json.dumps(

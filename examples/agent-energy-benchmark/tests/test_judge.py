@@ -123,6 +123,15 @@ class ArtifactJudgeTest(unittest.TestCase):
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             )
 
+    def test_reference_preserves_out_of_range_integer_kinds(self) -> None:
+        events = [(0, -1, 5), (0, 4, 7), (1, 0, 11)]
+        summary = judge.reference_summary(events)
+        self.assertEqual(summary[0]["count"], 2)
+        self.assertEqual(
+            summary[0]["kind_counts"], dict.fromkeys(judge.EVENT_KINDS, 0)
+        )
+        self.assertEqual(summary[0]["rolling"], 18446744072705552647)
+
 
 if __name__ == "__main__":
     unittest.main()
