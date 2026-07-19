@@ -163,13 +163,41 @@ The lower-level schema-v1 artifact described in `clients/python/README.md` is
 accepted only for an exploratory local-domain comparison; it cannot authorize a
 confirmatory physical claim.
 
-That calibration is an operator-provided prerequisite; this runner does not
-manufacture or infer it from treatment trials. Collect the regimes and strict
-thresholds with the offline calibration workflow in
-[`docs/energy-impact-study.md`](../../docs/energy-impact-study.md#meter-calibration),
-then use the artifact APIs in
-[`clients/python/README.md`](../../clients/python/README.md#system-impact-study-artifacts).
-If it has not been measured for the current host and source, stop at preflight;
+Calibration is staged so the no-collector baseline cannot be confused with a
+capture taken while the daemon-wide `powermetrics` process is still running.
+First collect immutable instrumented runs from the live daemon:
+
+```bash
+python3 examples/agent-energy-benchmark/physical_calibration.py instrumented \
+  --plan /results/physical/physical-plan.json \
+  --socket /results/wattch-powerd.sock \
+  --wattch /absolute/wattch-core/target/release/wattch \
+  --out /results/physical/calibration-instrumented
+```
+
+Then stop `wattch-powerd` in its root terminal. The baseline subcommand fails
+closed if the socket remains or if either `wattch-powerd` or `powermetrics` is
+still visible. It replays the exact trusted commands and checks exact output:
+
+```bash
+python3 examples/agent-energy-benchmark/physical_calibration.py baseline \
+  --instrumented /results/physical/calibration-instrumented/instrumented.json \
+  --socket /results/wattch-powerd.sock \
+  --out /results/physical/calibration-baseline
+
+python3 examples/agent-energy-benchmark/physical_calibration.py finalize \
+  --instrumented /results/physical/calibration-instrumented/instrumented.json \
+  --baseline /results/physical/calibration-baseline/baseline.json \
+  --assessment /results/physical/meter-calibration-assessment.json \
+  --out /results/physical/meter-calibration.json \
+  --calibration-id agent-energy-mac-250ms-v1
+```
+
+Finalization measures overhead, missingness, and phase sensitivity offline and
+publishes `meter-calibration.json` only when all three strict thresholds pass.
+Raw runs and the assessment remain available when a threshold fails. This is
+the lower-level exploratory workflow specified in
+[`docs/energy-impact-study.md`](../../docs/energy-impact-study.md#meter-calibration);
 do not create a placeholder calibration JSON.
 
 ```bash
