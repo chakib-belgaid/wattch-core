@@ -518,6 +518,57 @@ fn run_success_emits_clean_json_and_complete_artifact() {
 }
 
 #[test]
+fn run_records_and_drains_during_pre_spawn_delay() {
+    let (_server, socket) = start_server("pre-spawn-delay", BackendShape::Cumulative);
+    let out = output_root("pre-spawn-delay-out");
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--out")
+        .arg(&out)
+        .arg("--interval-ms")
+        .arg("10")
+        .arg("--pre-spawn-delay-us")
+        .arg("25000")
+        .arg("--run-id")
+        .arg("run-pre-spawn-delay")
+        .arg("--json")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(25));
+    let result = summary(&output);
+    let run_dir = PathBuf::from(result["run_dir"].as_str().unwrap());
+    let command: Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("command.json")).unwrap())
+            .unwrap();
+    assert_eq!(command["pre_spawn_delay_us"], 25_000);
+    let spawn_ns = replayed_events(&run_dir)
+        .into_iter()
+        .find(|event| event.kind == "TARGET_SPAWN")
+        .unwrap()
+        .monotonic_ns;
+    let mut samples_before_spawn = 0;
+    replay_trace(&run_dir, |batch| {
+        samples_before_spawn += batch
+            .samples
+            .into_iter()
+            .filter(|sample| sample.monotonic_ns <= spawn_ns)
+            .count();
+    })
+    .unwrap();
+    assert!(samples_before_spawn >= 2);
+
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
 fn run_passes_through_nonzero_and_signaled_child_statuses() {
     let (_server, socket) = start_server("statuses", BackendShape::Cumulative);
     let out = output_root("statuses-out");

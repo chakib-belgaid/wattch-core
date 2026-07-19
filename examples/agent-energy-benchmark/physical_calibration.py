@@ -241,6 +241,21 @@ def _analyze_run(
     }
     by_uid = {item.source_uid: item for item in descriptors}
     source = by_uid[source_uid]
+    source_samples = tuple(
+        sample for sample in samples if sample.source_id == source.local_source_id
+    )
+    prior_timestamps = [
+        sample.monotonic_ns
+        for sample in source_samples
+        if sample.monotonic_ns <= start_ns
+    ]
+    if not prior_timestamps or source.nominal_period_ns is None:
+        raise ValueError("capture cannot locate workload onset inside a native period")
+    marker_phase_fraction = (
+        start_ns - max(prior_timestamps)
+    ) / source.nominal_period_ns
+    if marker_phase_fraction >= 1:
+        raise ValueError("workload onset is not bracketed by consecutive native frames")
     required_uids = [source_uid]
     if source.temporality == "INTERVAL_AVERAGE":
         duration_uid = source.labels.get("wattch.interval_duration_source_uid")
@@ -258,6 +273,7 @@ def _analyze_run(
         "end_marker": end_kind,
         "energy_outcome": outcome.to_dict(),
         "marker_duration_s": (end_ns - start_ns) / 1e9,
+        "marker_phase_fraction": marker_phase_fraction,
         "marker_start_monotonic_ns": start_ns,
         "required_source_missing_sample_ratios": missing_ratios,
         "source_quality": {uid: quality[uid].to_dict() for uid in required_uids},
@@ -319,8 +335,6 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
         if args.cooldown_s:
             time.sleep(args.cooldown_s)
         phase_delay_s = float(item["phase_fraction"]) * interval_ns / 1e9
-        if phase_delay_s:
-            time.sleep(phase_delay_s)
         wattch_command = [
             str(wattch),
             "run",
@@ -334,6 +348,8 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
             str(args.timeout_ms),
             "--run-id",
             observation_id,
+            "--pre-spawn-delay-us",
+            str(round(phase_delay_s * 1_000_000)),
             "--label",
             "wattch.calibration=true",
             "--label",
@@ -358,13 +374,16 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
                 f"{observation_id} returned invalid Wattch JSON"
             ) from error
         run_dir = runs_root / observation_id
+        command_record = read_object(run_dir / "command.json")
         if (
             completed.returncode != 0
             or not isinstance(wrapper, dict)
             or wrapper.get("exit_code") != 0
             or (run_dir / "target.stdout.log").read_bytes() != expected_stdout
             or (run_dir / "target.stderr.log").read_bytes() != b""
-            or read_object(run_dir / "command.json").get("argv") != command
+            or command_record.get("argv") != command
+            or command_record.get("pre_spawn_delay_us")
+            != round(phase_delay_s * 1_000_000)
         ):
             raise ValueError(f"{observation_id} failed its exact workload gates")
         try:
@@ -394,12 +413,9 @@ def collect_instrumented(args: argparse.Namespace) -> dict[str, object]:
             < plan["acquisition"]["minimum_selected_source_samples"]
         ):
             raise ValueError(f"{observation_id} has too few selected-source samples")
-        actual_phase_fraction = (
-            int(analysis["marker_start_monotonic_ns"]) % interval_ns
-        ) / interval_ns
         observation = {
             **item,
-            "actual_marker_phase_fraction": actual_phase_fraction,
+            "actual_marker_phase_fraction": analysis["marker_phase_fraction"],
             "command": command,
             "expected_stdout_sha256": hashlib.sha256(expected_stdout).hexdigest(),
             "phase_delay_s": phase_delay_s,

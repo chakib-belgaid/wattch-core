@@ -76,6 +76,11 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
 
+        /// Delay after capture pre-roll and before TARGET_SPAWN while still
+        /// draining raw frames. Intended for native-sampling phase studies.
+        #[arg(long, default_value_t = 0)]
+        pre_spawn_delay_us: u64,
+
         /// Bound target wall time. On expiry Wattch terminates the target's
         /// dedicated process group, then finalizes the capture artifact.
         #[arg(long)]
@@ -230,6 +235,7 @@ fn main() -> Result<ExitCode> {
             socket,
             out,
             interval_ms,
+            pre_spawn_delay_us,
             timeout_ms,
             run_id,
             labels,
@@ -241,6 +247,7 @@ fn main() -> Result<ExitCode> {
                 socket,
                 out,
                 interval_ms,
+                pre_spawn_delay: Duration::from_micros(pre_spawn_delay_us),
                 timeout: timeout_ms.map(Duration::from_millis),
                 run_id,
                 labels: labels_to_map(labels)?,

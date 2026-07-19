@@ -167,6 +167,10 @@ confirmatory physical claim.
 
 Calibration is staged so the no-collector baseline cannot be confused with a
 capture taken while the daemon-wide `powermetrics` process is still running.
+The instrumented collector uses the CLI's post-pre-roll delay to place workload
+onset at four declared positions inside the native sampling period; raw frames
+continue draining during that delay and the realized phase is verified from
+the preceding source timestamp.
 First collect immutable instrumented runs from the live daemon:
 
 ```bash

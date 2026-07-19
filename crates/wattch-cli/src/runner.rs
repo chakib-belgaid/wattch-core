@@ -37,12 +37,14 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_KILL_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
+const MAX_PRE_SPAWN_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct RunCommandOptions {
     pub socket: PathBuf,
     pub out: PathBuf,
     pub interval_ms: u64,
+    pub pre_spawn_delay: Duration,
     pub timeout: Option<Duration>,
     pub run_id: String,
     pub labels: BTreeMap<String, String>,
@@ -82,6 +84,7 @@ struct CommandMetadata<'a> {
     stdio: StdioMetadata,
     process_group: &'static str,
     timeout_ms: Option<u128>,
+    pre_spawn_delay_us: u128,
     labels: &'a BTreeMap<String, String>,
 }
 
@@ -149,6 +152,7 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
         },
         process_group: "dedicated",
         timeout_ms: options.timeout.map(|timeout| timeout.as_millis()),
+        pre_spawn_delay_us: options.pre_spawn_delay.as_micros(),
         labels: &options.labels,
     };
     write_json_sidecar(writer.run_dir(), JsonSidecar::Command, &command_metadata)?;
@@ -172,6 +176,19 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
         if let Err(cleanup_error) = cleanup {
             error = error.context(format!(
                 "capture cleanup after pre-roll failure also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(finish_after_error(writer, &mut lifecycle, error));
+    }
+
+    if let Err(error) = wait_for_pre_spawn_delay(&mut session, &mut writer, options.pre_spawn_delay)
+    {
+        let cleanup = stop_and_drain(&mut session, &mut writer);
+        drop(session);
+        let mut error = error.context("failed during the pre-spawn capture delay");
+        if let Err(cleanup_error) = cleanup {
+            error = error.context(format!(
+                "capture cleanup after pre-spawn delay failure also failed: {cleanup_error:#}"
             ));
         }
         return Err(finish_after_error(writer, &mut lifecycle, error));
@@ -330,6 +347,9 @@ fn validate_options(options: &RunCommandOptions) -> Result<()> {
     }
     if options.timeout.is_some_and(|timeout| timeout.is_zero()) {
         bail!("--timeout-ms must be greater than zero");
+    }
+    if options.pre_spawn_delay > MAX_PRE_SPAWN_DELAY {
+        bail!("--pre-spawn-delay-us must not exceed 60000000");
     }
 
     // Validate every augmented marker before creating files or connecting.
@@ -537,6 +557,31 @@ fn wait_for_pre_roll(
                 }
                 if tail_tracker.pre_ready() {
                     return Ok(());
+                }
+            }
+            Err(error) if client_timeout(&error) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn wait_for_pre_spawn_delay(
+    session: &mut CaptureSession<'_>,
+    writer: &mut RunWriter,
+    delay: Duration,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(delay)
+        .ok_or_else(|| anyhow!("pre-spawn delay deadline is too large"))?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        match session.read_next(remaining.min(CAPTURE_POLL)) {
+            Ok(frame) => {
+                if persist_frame(writer, frame)?.is_some() {
+                    bail!("capture stopped during the pre-spawn delay");
                 }
             }
             Err(error) if client_timeout(&error) => continue,
