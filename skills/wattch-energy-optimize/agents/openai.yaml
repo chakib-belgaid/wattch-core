@@ -1,0 +1,6 @@
+interface:
+  display_name: "Wattch Energy Optimize"
+  short_description: "Measure and improve local code energy with Wattch"
+  default_prompt: "Use $wattch-energy-optimize to baseline this workload, make one correctness-preserving optimization, rerun the same measurement, and report qualified evidence."
+policy:
+  allow_implicit_invocation: true

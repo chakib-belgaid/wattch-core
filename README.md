@@ -96,6 +96,9 @@ crates/wattch-cli
 crates/wattch-mcp
   bounded MCP stdio tools for source discovery, stateful raw capture, and replay
 
+skills/wattch-energy-optimize
+  agent workflow for correctness-gated, boundary-aware local energy optimization
+
 clients/python
   pywattch: protocol client, pyJoules-compatible meter API, handlers,
   pyinstrument energy profiler, energy test discovery, experiment scheduling,
@@ -118,6 +121,8 @@ docs/mcp.md             local agent registration, tools, and safety boundary
 docs/architecture-start.md
 
 examples/scenarios      deterministic multi-source scenarios
+examples/agent-energy-benchmark
+  frozen Luna/Terra x skill control fixture and coordinator-owned evidence gates
 examples/energy-tests   demo energy test suite
 examples/bench          benchmark specs used later by the benchmark layer
 ```
@@ -215,6 +220,20 @@ Use `--socket /absolute/path.sock` in the registered command when the daemon is
 not in a trusted auto-discovery path. See [docs/mcp.md](docs/mcp.md) for the
 tool contract. The MCP adapter returns raw descriptors and integrity summaries;
 it does not compute or compare energy.
+
+Install the optional treatment skill in a project's recognized skill root:
+
+```bash
+mkdir -p .agents/skills
+cp -R skills/wattch-energy-optimize \
+  .agents/skills/wattch-energy-optimize
+```
+
+The package is intentionally separate from MCP access: control and treatment
+agents can receive the same CLI/MCP surface while only the treatment has the
+skill. See
+[examples/agent-energy-benchmark/README.md](examples/agent-energy-benchmark/README.md)
+for the exact-prompt Luna/Terra demonstration controls.
 
 Real Linux acquisition composes RAPL with the raw OS signals that are readable
 on the host:
