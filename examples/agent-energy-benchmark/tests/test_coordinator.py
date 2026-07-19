@@ -131,6 +131,8 @@ class CoordinatorTest(unittest.TestCase):
         self.assertEqual(prompt, "identical prompt\n")
         self.assertEqual(command[-1], "identical prompt\n")
         self.assertEqual(command.count("identical prompt\n"), 1)
+        self.assertLess(command.index("-a"), command.index("exec"))
+        self.assertGreater(command.index("--ignore-user-config"), command.index("exec"))
 
 
 if __name__ == "__main__":
