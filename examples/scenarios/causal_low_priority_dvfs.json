@@ -1,0 +1,122 @@
+{
+  "scenario_id": "causal_low_priority_dvfs_v0",
+  "run_id": "run-causal-low-priority-dvfs",
+  "node_id": "deterministic-lab",
+  "tick_ns": 1000000000,
+  "ticks": 29,
+  "sources": [
+    {
+      "local_source_id": 1,
+      "source_uid": "det://deterministic-lab/cpu/package/0/energy",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "CPU_PACKAGE_ENERGY",
+      "unit": "JOULE",
+      "temporality": "CUMULATIVE",
+      "evidence_class": "RAW_HARDWARE_COUNTER",
+      "source_path": "cpu/package/0/energy",
+      "parent_source_uid": null,
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 1000000000,
+      "max_value": null,
+      "resolution": 0.001,
+      "labels": { "domain": "package", "fixture": "low_priority_dvfs" },
+      "behavior": {
+        "type": "piecewise_linear",
+        "segments": [
+          { "start_tick": 0, "start": 100.0, "step_per_tick": 1.0 },
+          { "start_tick": 4, "start": 104.0, "step_per_tick": 3.0 },
+          { "start_tick": 8, "start": 116.0, "step_per_tick": 1.8 },
+          { "start_tick": 14, "start": 126.8, "step_per_tick": 1.5 },
+          { "start_tick": 18, "start": 132.8, "step_per_tick": 2.2 },
+          { "start_tick": 22, "start": 141.6, "step_per_tick": 1.6 }
+        ]
+      }
+    },
+    {
+      "local_source_id": 2,
+      "source_uid": "det://deterministic-lab/cpu/package/0/frequency",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "P_STATE_FREQUENCY",
+      "unit": "HERTZ",
+      "temporality": "GAUGE",
+      "evidence_class": "OS_TELEMETRY",
+      "source_path": "cpu/package/0/frequency",
+      "parent_source_uid": "det://deterministic-lab/cpu/package/0/energy",
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 1000000000,
+      "max_value": null,
+      "resolution": 1000000.0,
+      "labels": { "scope": "package", "fixture": "low_priority_dvfs" },
+      "behavior": {
+        "type": "piecewise_linear",
+        "segments": [
+          { "start_tick": 0, "start": 1200000000.0, "step_per_tick": 0.0 },
+          { "start_tick": 4, "start": 3800000000.0, "step_per_tick": 0.0 },
+          { "start_tick": 8, "start": 1800000000.0, "step_per_tick": 0.0 },
+          { "start_tick": 14, "start": 2400000000.0, "step_per_tick": 0.0 }
+        ]
+      }
+    },
+    {
+      "local_source_id": 3,
+      "source_uid": "det://deterministic-lab/cpu/package/0/cstate/c10_residency",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "C_STATE_RESIDENCY",
+      "unit": "PERCENT",
+      "temporality": "GAUGE",
+      "evidence_class": "OS_TELEMETRY",
+      "source_path": "cpu/package/0/cstate/c10_residency",
+      "parent_source_uid": "det://deterministic-lab/cpu/package/0/energy",
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 1000000000,
+      "max_value": 100.0,
+      "resolution": 0.1,
+      "labels": { "state": "c10", "fixture": "low_priority_dvfs" },
+      "behavior": {
+        "type": "piecewise_linear",
+        "segments": [
+          { "start_tick": 0, "start": 80.0, "step_per_tick": 0.0 },
+          { "start_tick": 4, "start": 5.0, "step_per_tick": 0.0 },
+          { "start_tick": 8, "start": 35.0, "step_per_tick": 0.0 },
+          { "start_tick": 14, "start": 20.0, "step_per_tick": 0.0 },
+          { "start_tick": 18, "start": 15.0, "step_per_tick": 0.0 }
+        ]
+      }
+    },
+    {
+      "local_source_id": 4,
+      "source_uid": "det://deterministic-lab/benchmark/completed-work",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "OTHER",
+      "unit": "COUNTER",
+      "temporality": "CUMULATIVE",
+      "evidence_class": "BENCHMARK_MARKER",
+      "source_path": "benchmark/completed-work",
+      "parent_source_uid": null,
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 1000000000,
+      "max_value": null,
+      "resolution": 0.001,
+      "labels": { "scope": "fixture", "fixture": "low_priority_dvfs" },
+      "behavior": {
+        "type": "piecewise_linear",
+        "segments": [
+          { "start_tick": 0, "start": 0.0, "step_per_tick": 0.0 },
+          { "start_tick": 4, "start": 0.0, "step_per_tick": 25.0 },
+          { "start_tick": 8, "start": 100.0, "step_per_tick": 16.666666666666668 },
+          { "start_tick": 14, "start": 200.0, "step_per_tick": 0.0 },
+          { "start_tick": 18, "start": 200.0, "step_per_tick": 25.0 },
+          { "start_tick": 22, "start": 300.0, "step_per_tick": 16.666666666666668 }
+        ]
+      }
+    }
+  ]
+}

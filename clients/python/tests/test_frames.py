@@ -6,6 +6,7 @@ import pytest
 
 from pywattch._frames import (
     HEADER_LEN,
+    MAX_LEGACY_ARTIFACT_PAYLOAD_LEN,
     MAX_PAYLOAD_LEN,
     FrameKind,
     decode_header,
@@ -16,9 +17,9 @@ from pywattch.errors import WattchConnectionError, WattchProtocolError
 
 
 def test_frame_layout_is_byte_compatible_with_rust():
-    # Golden bytes: WCH0, wire 0.1 LE, kind=1 LE, flags=0, len=3 LE, payload.
+    # Golden bytes: WCH0, wire 0.2 LE, kind=1 LE, flags=0, len=3 LE, payload.
     frame = encode_frame(FrameKind.HELLO_REQUEST, b"abc")
-    assert frame == bytes.fromhex("57434830" "0000" "0100" "0100" "0000" "03000000") + b"abc"
+    assert frame == bytes.fromhex("57434830" "0000" "0200" "0100" "0000" "03000000") + b"abc"
     assert len(frame) == HEADER_LEN + 3
 
 
@@ -31,13 +32,15 @@ def test_header_round_trip_all_kinds():
         assert payload_len == 2
 
 
-def test_kind_values_match_protocol_v01():
+def test_kind_values_match_protocol_v02():
     assert FrameKind.HELLO_REQUEST == 1
     assert FrameKind.HELLO_RESPONSE == 2
     assert FrameKind.START_CAPTURE == 3
     assert FrameKind.STOP_CAPTURE == 4
     assert FrameKind.START_CAPTURE_ACK == 5
     assert FrameKind.STOP_CAPTURE_ACK == 6
+    assert FrameKind.RECORD_EVENT == 7
+    assert FrameKind.RECORD_EVENT_ACK == 8
     assert FrameKind.RAW_SAMPLE_BATCH == 10
     assert FrameKind.EVENT_BATCH == 11
     assert FrameKind.ERROR == 255
@@ -64,11 +67,40 @@ def test_rejects_wrong_wire_version():
         decode_header(bytes(frame))
 
 
+def test_reads_v01_raw_frame_headers_but_rejects_v02_kinds():
+    legacy = bytearray(encode_frame(FrameKind.RAW_SAMPLE_BATCH, b"{}"))
+    legacy[6:8] = (1).to_bytes(2, "little")
+    kind, flags, payload_len = decode_header(bytes(legacy))
+    assert (kind, flags, payload_len) == (FrameKind.RAW_SAMPLE_BATCH, 0, 2)
+
+    legacy_event = bytearray(encode_frame(FrameKind.EVENT_BATCH, b"{}"))
+    legacy_event[6:8] = (1).to_bytes(2, "little")
+    with pytest.raises(WattchProtocolError, match="requires wire version 0.2"):
+        decode_header(bytes(legacy_event))
+
+
 def test_rejects_oversized_payload_header():
     frame = bytearray(encode_frame(FrameKind.HELLO_REQUEST, b""))
     frame[12:16] = (MAX_PAYLOAD_LEN + 1).to_bytes(4, "little")
     with pytest.raises(WattchProtocolError, match="too large"):
         decode_header(bytes(frame))
+
+
+def test_explicit_legacy_artifact_limit_does_not_weaken_live_limit():
+    frame = bytearray(encode_frame(FrameKind.RAW_SAMPLE_BATCH, b""))
+    frame[6:8] = (1).to_bytes(2, "little")
+    frame[12:16] = (MAX_PAYLOAD_LEN + 1).to_bytes(4, "little")
+
+    with pytest.raises(WattchProtocolError, match="too large"):
+        decode_header(bytes(frame))
+    kind, flags, payload_len = decode_header(
+        bytes(frame), max_payload_len=MAX_LEGACY_ARTIFACT_PAYLOAD_LEN
+    )
+    assert (kind, flags, payload_len) == (
+        FrameKind.RAW_SAMPLE_BATCH,
+        0,
+        MAX_PAYLOAD_LEN + 1,
+    )
 
 
 def test_read_deadline_is_absolute_across_trickled_bytes():

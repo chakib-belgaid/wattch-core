@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wattch_cli::artifact::{inspect_run, RunWriter};
-use wattch_cli::client::WattchClient;
+use wattch_cli::artifact::{inspect_run, RunWriter, CLOCK_INSTANCE_ID_LABEL};
+use wattch_cli::client::{CaptureFrame, WattchClient};
 use wattch_core::{validate_source_set, RunManifest, SourceDescriptor};
 use wattch_protocol::PROTOCOL_VERSION;
 
@@ -109,30 +109,41 @@ fn main() -> Result<()> {
             validate_source_set(&hello.sources)
                 .context("daemon advertised an invalid source set")?;
 
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert(
+                CLOCK_INSTANCE_ID_LABEL.to_string(),
+                hello.clock_instance_id.clone(),
+            );
             let manifest = RunManifest {
                 run_id: run_id.clone(),
                 node_id: hello.node_id.clone(),
                 protocol_version: hello.protocol_version.clone(),
+                clock_instance_id: hello.clock_instance_id.clone(),
                 wattch_version: env!("CARGO_PKG_VERSION").to_string(),
                 created_unix_ns: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0),
                 sources: hello.sources.clone(),
-                labels: Default::default(),
+                labels,
             };
 
             let mut writer = RunWriter::create(&out, &manifest)?;
             let mut capture_error: Option<anyhow::Error> = None;
-            let ack = client.capture(
+            let ack = client.capture_with_events(
                 &run_id,
                 interval_ms,
                 Duration::from_millis(duration_ms),
-                |batch| {
+                |frame| {
                     if capture_error.is_some() {
                         return;
                     }
-                    if let Err(err) = writer.append_batch(&batch) {
+                    let result = match frame {
+                        CaptureFrame::RawSampleBatch(batch) => writer.append_batch(&batch),
+                        CaptureFrame::EventBatch(batch) => writer.append_event_batch(&batch),
+                        CaptureFrame::RecordEventAck(_) | CaptureFrame::StopCaptureAck(_) => Ok(()),
+                    };
+                    if let Err(err) = result {
                         capture_error = Some(err.into());
                     }
                 },
@@ -152,7 +163,10 @@ fn main() -> Result<()> {
         Command::Inspect { run } => {
             let report = inspect_run(&run)?;
             println!("run: {} (node {})", report.run_id, report.node_id);
-            println!("batches: {}  samples: {}", report.batches, report.samples);
+            println!(
+                "batches: {}  samples: {}  event_batches: {}  events: {}",
+                report.batches, report.samples, report.event_batches, report.events
+            );
             if report.unknown_source_samples > 0 {
                 println!(
                     "WARNING: {} samples reference unknown source ids",

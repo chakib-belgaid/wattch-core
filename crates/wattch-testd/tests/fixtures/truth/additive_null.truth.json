@@ -1,0 +1,19 @@
+{
+  "scenario_file": "causal_additive_null.json",
+  "primary_source_id": 1,
+  "windows": {
+    "idle_control": { "start_tick": 0, "end_tick": 4 },
+    "background_control": { "start_tick": 4, "end_tick": 8 },
+    "p1_idle": { "start_tick": 8, "end_tick": 12 },
+    "p1_background": { "start_tick": 12, "end_tick": 16 },
+    "p2_idle": { "start_tick": 16, "end_tick": 20 },
+    "p2_background": { "start_tick": 20, "end_tick": 24 }
+  },
+  "expected": {
+    "p1_idle_incremental_joules_per_tick": 0.4,
+    "p1_background_incremental_joules_per_tick": 0.4,
+    "p2_idle_incremental_joules_per_tick": 0.25,
+    "p2_background_incremental_joules_per_tick": 0.25
+  },
+  "claim": "program effects are additive under the null fixture"
+}

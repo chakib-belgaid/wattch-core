@@ -1,4 +1,4 @@
-"""A pure-Python fake Wattch daemon speaking protocol v0.1 for tests."""
+"""A pure-Python fake Wattch daemon speaking protocol v0.2 for tests."""
 
 from __future__ import annotations
 
@@ -134,14 +134,16 @@ class FakeDaemon:
                 {
                     "daemon_name": "fake-daemon",
                     "daemon_version": "0.0.0",
-                    "protocol_version": "0.1.0",
+                    "protocol_version": "0.2.0",
                     "node_id": self.node_id,
+                    "clock_instance_id": "fake-clock-instance",
                     "sources": self.descriptors,
                 },
             )
 
             tick = 0
             batch_seq = 0
+            event_batch_seq = 0
             start_ns = time.monotonic_ns()
             while not self._stop.is_set():
                 kind, payload = read_frame(conn)
@@ -201,7 +203,7 @@ class FakeDaemon:
                     # Poll for StopCapture without tearing frames.
                     readable, _, _ = select.select([conn], [], [], interval_s)
                     if readable:
-                        kind, _stop_payload = read_frame(conn)
+                        kind, control_payload = read_frame(conn)
                         if kind == FrameKind.STOP_CAPTURE:
                             self._send(
                                 conn,
@@ -213,6 +215,32 @@ class FakeDaemon:
                                 },
                             )
                             break
+                        if kind == FrameKind.RECORD_EVENT:
+                            marker = json.loads(control_payload)
+                            event = {
+                                "event_id": marker["event_id"],
+                                "run_id": marker["run_id"],
+                                "node_id": self.node_id,
+                                "monotonic_ns": time.monotonic_ns() - start_ns,
+                                "kind": marker["kind"],
+                                "labels": marker.get("labels") or {},
+                            }
+                            self._send(
+                                conn,
+                                FrameKind.EVENT_BATCH,
+                                {
+                                    "run_id": request["run_id"],
+                                    "node_id": self.node_id,
+                                    "batch_sequence_no": event_batch_seq,
+                                    "events": [event],
+                                },
+                            )
+                            event_batch_seq += 1
+                            self._send(
+                                conn,
+                                FrameKind.RECORD_EVENT_ACK,
+                                {"event": event},
+                            )
         except Exception:
             pass
         finally:

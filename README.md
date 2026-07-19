@@ -20,22 +20,33 @@ The stronger question is:
 What did this software version cause the system to do?
 ```
 
-That includes direct energy, runtime, wakeups, C-state behavior, scheduling effects, idle recovery, and eventually AI-specific spans such as requests, tokens, tool calls, and agent steps.
+That includes boundary-specific system energy, runtime, wakeups, C-state
+behavior, scheduling effects, idle recovery, and eventually AI-specific spans
+such as requests, tokens, tool calls, and agent steps. It does not imply that
+the daemon can isolate a process's private energy.
 
 ## Current phase
 
 The production foundation is implemented end to end:
 
 ```text
-strict protocol v0.1 over local Unix sockets (binary frames, JSON payloads)
+strict protocol v0.2 over local Unix sockets (binary frames, JSON payloads,
+daemon-stamped events, and v0.1 raw-trace readability)
 clear daemon/client boundary
-wattch-powerd powermeter daemon: linux-rapl (powercap) + synthetic backends
+wattch-powerd: linux-rapl, Apple powermetrics, and synthetic power backends,
+plus descriptor-preserving Linux OS-telemetry composition
 wattch-testd deterministic daemon for protocol validation and golden tests
 CLI capture/inspect/validate workflow with replayable trace artifacts
 pywattch Python client: updated pyJoules-compatible API
+matched C0/C1/C2 experiment scheduling, raw trial artifacts, boundary-aware
+offline energy outcomes, paired effects, and a control-only dynamic baseline
 pyinstrument energy profiler (time-share attribution, clearly labelled)
 energy tests: discovery + runner CLI + VSCode "Energy Tests" extension
 ```
+
+The repository implements the measurement and analysis machinery; it does not
+claim that the ranking-reversal hypothesis has already been established on real
+hardware.
 
 ## Why the daemon boundary matters
 
@@ -43,8 +54,8 @@ Modern Linux RAPL access may require elevated privileges. Wattch should therefor
 
 ```text
 root/admin side:
-  rapl-wattchd
-    reads protected RAPL counters
+  wattch-powerd
+    reads protected RAPL counters or powermetrics values
     exposes Wattch protocol over a local socket
 
 user side:
@@ -55,7 +66,9 @@ user side:
   AI evaluation tools
 ```
 
-The daemon is the measurement boundary. The clients should not need root.
+The daemon is the privilege and acquisition boundary. The research measurement
+boundary is the explicitly selected source domain. Clients should not need
+root.
 
 ## What this repository contains
 
@@ -64,13 +77,14 @@ crates/wattch-core
   shared domain primitives: source descriptors, units, evidence classes, samples, manifests, validation
 
 crates/wattch-protocol
-  frame envelope, typed v0.1 messages, stream read/write helpers
+  frame envelope, typed v0.2 messages, v0.1 trace decoding, stream helpers
 
 crates/wattch-daemon
   shared daemon runtime: socket server, session state machine, batching, sequence numbers
 
 crates/wattch-powerd
-  powermeter daemon: linux-rapl (powercap sysfs) and synthetic backends
+  powermeter daemon: linux-rapl, Apple powermetrics, synthetic, and raw
+  Linux OS telemetry through one descriptor-preserving composite backend
 
 crates/wattch-testd
   deterministic daemon serving scenario files over the same protocol
@@ -80,7 +94,8 @@ crates/wattch-cli
 
 clients/python
   pywattch: protocol client, pyJoules-compatible meter API, handlers,
-  pyinstrument energy profiler, energy test discovery + runner CLI
+  pyinstrument energy profiler, energy test discovery, experiment scheduling,
+  immutable trial artifacts, and offline causal/model analysis primitives
 
 editors/vscode-energy-tests
   VSCode extension: Energy Tests view and results tab
@@ -93,6 +108,7 @@ proto/wattch/v0/wattch.proto
 
 docs/protocol-v0.md     protocol rules, wire format, invariants
 docs/powerd.md          powermeter daemon install and privilege model
+docs/energy-impact-study.md  boundary-specific causal study and falsification plan
 docs/energy-tests.md    energy test conventions and semantics
 docs/architecture-start.md
 
@@ -107,10 +123,11 @@ examples/bench          benchmark specs used later by the benchmark layer
 NVML acquisition
 PowerAPI or HWPC Sensor adapters
 impact scoring
-benchmark statistics
 MCP server
 HTML reports
 cluster coordinator
+per-process energy allocation
+absolute meter-accuracy claims without external calibration
 ```
 
 ## Architecture rule
@@ -126,6 +143,7 @@ read raw values
 timestamp samples
 assign sequence numbers
 batch samples
+stamp benchmark events
 stream or write raw traces
 ```
 
@@ -150,18 +168,48 @@ Daemon + CLI:
 ```bash
 cargo build --workspace
 
-# powermeter daemon (auto picks linux-rapl when available, else synthetic)
-./target/debug/wattch-powerd &
+# Private runtime directory: daemon and clients share this path. This also
+# makes auto-discovery work on macOS and other hosts without XDG_RUNTIME_DIR.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
+
+# Privilege-free, cross-platform development daemon.
+./target/debug/wattch-powerd --backend synthetic --os-telemetry off &
 
 ./target/debug/wattch sources
 ./target/debug/wattch capture --out runs --duration-ms 2000
 ./target/debug/wattch inspect --run runs/<run-id>
 ```
 
+Real Linux acquisition composes RAPL with the raw OS signals that are readable
+on the host:
+
+```bash
+sudo ./target/debug/wattch-powerd \
+  --backend linux-rapl \
+  --os-telemetry auto
+```
+
+On macOS, `--backend apple-powermetrics` exposes separate CPU/GPU/ANE
+`TOOL_DERIVED_ESTIMATE` interval-average sources plus each plist frame's raw
+`elapsed_ns`, and requires the privilege needed by `/usr/bin/powermetrics`.
+Offline study analysis synchronizes the contiguous native-duration timeline to
+all daemon receipt anchors, rejects excessive drift or receipt residuals, and
+integrates exact interval/window overlap—never a trapezoid between receipt
+points. It is a separate measurement boundary from RAPL and must be calibrated
+on the actual host before empirical use;
+deterministic parser and lifecycle tests are not a privileged live-meter
+validation.
+
 Python (updated pyJoules API):
 
 ```bash
 cd clients/python && python3 -m venv .venv && .venv/bin/pip install -e '.[dev,profiler]'
+```
+
+Add the `analysis` extra when publishing `features.parquet`:
+
+```bash
+cd clients/python && .venv/bin/pip install -e '.[analysis]'
 ```
 
 ```python
@@ -205,8 +253,15 @@ pywattch client (unprivileged)
   ↓
 wattch-powerd local socket (privileged when the backend needs it)
   ↓
-raw counters: linux-rapl powercap, synthetic, future NVML/...
+linux-rapl counters / Apple powermetrics estimates / raw Linux OS telemetry /
+synthetic evidence / future backends
 ```
+
+For system-impact research, the runner captures all relevant raw sources but
+freezes one `MeasurementBoundary` as the energy outcome. RAPL package, RAPL
+PSys, and Apple `powermetrics` therefore produce boundary-qualified results;
+none is automatically called whole-machine electrical energy. See
+[the energy-impact study](docs/energy-impact-study.md).
 
 Future HWPC Sensor integration remains out of scope. It may later become a socket/import adapter, not a core dependency.
 

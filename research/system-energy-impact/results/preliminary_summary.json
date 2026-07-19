@@ -1,0 +1,7 @@
+{
+  "deterministic_all_passed": true,
+  "real_meter_available": false,
+  "real_meter_blocker": "This macOS host exposes powermetrics only to a privileged daemon; non-interactive sudo was unavailable in this session.",
+  "workload_output_equivalence": true,
+  "workload_position_balanced": true
+}

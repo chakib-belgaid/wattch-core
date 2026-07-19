@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use wattch_core::{validate_source_set, RawSample, RawSampleBatch, SourceDescriptor};
 use wattch_protocol::frame::WireError;
 use wattch_protocol::messages::{
-    error_codes, read_message, validate_run_id, write_message, ErrorMessage, HelloResponse,
-    Message, StartCaptureAck, StopCaptureAck,
+    error_codes, read_message, validate_record_event, validate_run_id, write_message, ErrorMessage,
+    Event, EventBatch, HelloResponse, Message, RecordEventAck, StartCaptureAck, StopCaptureAck,
 };
 use wattch_protocol::PROTOCOL_VERSION;
 
@@ -26,6 +26,46 @@ pub struct DaemonIdentity {
     pub daemon_name: String,
     pub daemon_version: String,
     pub node_id: String,
+}
+
+/// One monotonic epoch shared by every connection served by a daemon
+/// instance. The opaque id lets offline consumers reject accidental joins
+/// across daemon restarts without assigning wall-clock meaning to samples.
+#[derive(Debug)]
+struct DaemonClock {
+    origin: Instant,
+    instance_id: String,
+}
+
+impl DaemonClock {
+    fn new() -> Self {
+        static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+        let unix_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self {
+            origin: Instant::now(),
+            instance_id: format!(
+                "wattch-clock-{:x}-{unix_nanos:x}-{sequence:x}",
+                std::process::id()
+            ),
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn timestamp_ns(&self, acquired_at: Instant) -> u64 {
+        acquired_at
+            .checked_duration_since(self.origin)
+            .unwrap_or_default()
+            .as_nanos()
+            .min(u64::MAX as u128) as u64
+    }
 }
 
 /// Where the listening socket comes from.
@@ -269,6 +309,7 @@ where
         limits.max_active_captures,
         limits.max_active_captures_per_uid,
     );
+    let daemon_clock = Arc::new(DaemonClock::new());
     #[cfg(not(target_os = "linux"))]
     warn!(
         "peer authentication unavailable on this platform; \
@@ -328,6 +369,7 @@ where
                     let factory = Arc::clone(&factory);
                     let limits = limits.clone();
                     let capture_pool = Arc::clone(&capture_pool);
+                    let daemon_clock = Arc::clone(&daemon_clock);
                     thread::spawn(move || {
                         let _connection_permit = connection_permit;
                         if let Err(err) = handle_connection(
@@ -337,6 +379,7 @@ where
                             &limits,
                             &capture_pool,
                             peer_uid,
+                            daemon_clock.as_ref(),
                         ) {
                             debug!(error = %err, "connection ended with error");
                         }
@@ -451,6 +494,7 @@ fn handle_connection(
     limits: &ServerLimits,
     capture_pool: &Arc<PermitPool>,
     peer_uid: Option<u32>,
+    daemon_clock: &DaemonClock,
 ) -> Result<(), WireError> {
     let first = match read_message_before(&mut stream, limits.hello_timeout) {
         Ok(message) => message,
@@ -504,14 +548,15 @@ fn handle_connection(
             daemon_version: identity.daemon_version.clone(),
             protocol_version: PROTOCOL_VERSION.to_string(),
             node_id: identity.node_id.clone(),
+            clock_instance_id: daemon_clock.instance_id.clone(),
             sources: descriptors.clone(),
         }),
     )?;
 
-    let session_start = Instant::now();
     let mut sequence_numbers: BTreeMap<u32, u64> =
         descriptors.iter().map(|d| (d.local_source_id, 0)).collect();
     let mut batch_sequence_no: u64 = 0;
+    let mut event_batch_sequence_no: u64 = 0;
 
     loop {
         let request = match read_message_before(&mut stream, limits.session_idle_timeout) {
@@ -593,6 +638,7 @@ fn handle_connection(
                     continue;
                 };
 
+                backend.begin_capture();
                 write_message(
                     &mut stream,
                     &Message::StartCaptureAck(StartCaptureAck {
@@ -608,9 +654,10 @@ fn handle_connection(
                     &start.run_id,
                     Duration::from_millis(start.interval_ms),
                     &unique,
-                    session_start,
+                    daemon_clock,
                     &mut sequence_numbers,
                     &mut batch_sequence_no,
+                    &mut event_batch_sequence_no,
                     limits.max_capture_duration,
                 )?;
 
@@ -658,6 +705,17 @@ fn handle_connection(
                     );
                 }
             }
+            Message::RecordEvent(event) => {
+                if let Err(reason) = validate_record_event(&event) {
+                    send_error(&mut stream, error_codes::INVALID_REQUEST, reason);
+                } else {
+                    send_error(
+                        &mut stream,
+                        error_codes::NO_ACTIVE_CAPTURE,
+                        "no capture is active",
+                    );
+                }
+            }
             other => {
                 send_error(
                     &mut stream,
@@ -688,9 +746,10 @@ fn run_capture(
     run_id: &str,
     interval: Duration,
     selected: &BTreeSet<u32>,
-    session_start: Instant,
+    daemon_clock: &DaemonClock,
     sequence_numbers: &mut BTreeMap<u32, u64>,
     batch_sequence_no: &mut u64,
+    event_batch_sequence_no: &mut u64,
     max_capture_duration: Duration,
 ) -> Result<CaptureEnd, WireError> {
     let stop_flag = AtomicBool::new(false);
@@ -699,11 +758,15 @@ fn run_capture(
     // connection instead of emitting a misleading partial acknowledgement.
     let batches_sent_counter = AtomicU64::new(0);
     let samples_sent_counter = AtomicU64::new(0);
-    let mut writer = stream.try_clone()?;
+    let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = stream.try_clone()?;
+    let capture_deadline = Instant::now()
+        .checked_add(max_capture_duration)
+        .ok_or_else(|| WireError::Io(io::Error::other("capture deadline is too large")))?;
 
     thread::scope(|scope| {
         let producer = scope.spawn(|| -> Result<(), WireError> {
+            let writer = Arc::clone(&writer);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                 || -> Result<(), WireError> {
                     loop {
@@ -711,20 +774,20 @@ fn run_capture(
                             return Ok(());
                         }
 
-                        let monotonic_ns = session_start.elapsed().as_nanos() as u64;
-                        let readings = backend.sample();
+                        let readings = backend.sample_acquired();
                         let samples: Vec<RawSample> = readings
                             .into_iter()
-                            .filter(|(id, _)| selected.contains(id))
-                            .map(|(source_id, value)| {
+                            .filter(|reading| selected.contains(&reading.local_source_id))
+                            .map(|reading| {
+                                let source_id = reading.local_source_id;
                                 let next = sequence_numbers.entry(source_id).or_insert(0);
                                 let sequence_no = *next;
                                 *next += 1;
                                 RawSample {
                                     source_id,
                                     sequence_no,
-                                    monotonic_ns,
-                                    value,
+                                    monotonic_ns: daemon_clock.timestamp_ns(reading.acquired_at),
+                                    value: reading.value,
                                 }
                             })
                             .collect();
@@ -737,10 +800,11 @@ fn run_capture(
                             samples,
                         };
                         *batch_sequence_no += 1;
-                        if let Err(err) =
-                            write_message(&mut writer, &Message::RawSampleBatch(batch))
-                        {
-                            let _ = writer.shutdown(Shutdown::Both);
+                        if let Err(err) = write_capture_messages(
+                            writer.as_ref(),
+                            &[Message::RawSampleBatch(batch)],
+                        ) {
+                            shutdown_capture_writer(writer.as_ref());
                             return Err(err);
                         }
                         samples_sent_counter.fetch_add(sample_count, Ordering::SeqCst);
@@ -763,7 +827,7 @@ fn run_capture(
             match result {
                 Ok(result) => result,
                 Err(_) => {
-                    let _ = writer.shutdown(Shutdown::Both);
+                    shutdown_capture_writer(writer.as_ref());
                     Err(WireError::Io(io::Error::other(
                         "capture producer thread panicked",
                     )))
@@ -771,26 +835,109 @@ fn run_capture(
             }
         });
 
-        let end = match read_message_before(&mut reader, max_capture_duration) {
-            Ok(Message::StopCapture(stop)) if validate_run_id(&stop.run_id).is_err() => Some(
-                CaptureEnd::ProtocolViolation("invalid StopCapture run_id".to_string()),
-            ),
-            Ok(Message::StopCapture(stop)) if stop.run_id == run_id => None,
-            Ok(Message::StopCapture(_)) => Some(CaptureEnd::ProtocolViolation(
-                "StopCapture run_id does not match the active run".to_string(),
-            )),
-            Ok(other) => Some(CaptureEnd::ProtocolViolation(format!(
-                "unexpected {:?} during capture",
-                other.kind()
-            ))),
-            Err(err) if is_timeout(&err) => Some(CaptureEnd::TimedOut),
-            Err(_) => Some(CaptureEnd::Disconnected),
+        let mut seen_event_ids = BTreeSet::new();
+        let mut capture_write_error = None;
+        let end = loop {
+            let Some(remaining) = capture_deadline.checked_duration_since(Instant::now()) else {
+                break Some(CaptureEnd::TimedOut);
+            };
+
+            match read_message_before(&mut reader, remaining) {
+                Ok(Message::RecordEvent(request)) => {
+                    if let Err(reason) = validate_record_event(&request) {
+                        if let Err(err) = write_capture_messages(
+                            writer.as_ref(),
+                            &[Message::Error(ErrorMessage {
+                                code: error_codes::INVALID_REQUEST,
+                                message: reason.to_string(),
+                            })],
+                        ) {
+                            capture_write_error = Some(err);
+                            break Some(CaptureEnd::Disconnected);
+                        }
+                        continue;
+                    }
+                    if request.run_id != run_id {
+                        break Some(CaptureEnd::ProtocolViolation(
+                            "RecordEvent run_id does not match the active run".to_string(),
+                        ));
+                    }
+                    if seen_event_ids.contains(&request.event_id) {
+                        if let Err(err) = write_capture_messages(
+                            writer.as_ref(),
+                            &[Message::Error(ErrorMessage {
+                                code: error_codes::INVALID_REQUEST,
+                                message: "event_id must be unique within a capture".to_string(),
+                            })],
+                        ) {
+                            capture_write_error = Some(err);
+                            break Some(CaptureEnd::Disconnected);
+                        }
+                        continue;
+                    }
+
+                    let event = Event {
+                        event_id: request.event_id.clone(),
+                        run_id: run_id.to_string(),
+                        node_id: identity.node_id.clone(),
+                        monotonic_ns: daemon_clock.now_ns(),
+                        kind: request.kind,
+                        labels: request.labels,
+                    };
+                    let event_batch = EventBatch {
+                        run_id: run_id.to_string(),
+                        node_id: identity.node_id.clone(),
+                        batch_sequence_no: *event_batch_sequence_no,
+                        events: vec![event.clone()],
+                    };
+                    let acknowledgement = RecordEventAck {
+                        event: event.clone(),
+                    };
+                    if let Err(err) = write_capture_messages(
+                        writer.as_ref(),
+                        &[
+                            Message::EventBatch(event_batch),
+                            Message::RecordEventAck(acknowledgement),
+                        ],
+                    ) {
+                        capture_write_error = Some(err);
+                        break Some(CaptureEnd::Disconnected);
+                    }
+                    *event_batch_sequence_no += 1;
+                    seen_event_ids.insert(event.event_id);
+                }
+                Ok(Message::StopCapture(stop)) if validate_run_id(&stop.run_id).is_err() => {
+                    break Some(CaptureEnd::ProtocolViolation(
+                        "invalid StopCapture run_id".to_string(),
+                    ));
+                }
+                Ok(Message::StopCapture(stop)) if stop.run_id == run_id => break None,
+                Ok(Message::StopCapture(_)) => {
+                    break Some(CaptureEnd::ProtocolViolation(
+                        "StopCapture run_id does not match the active run".to_string(),
+                    ));
+                }
+                Ok(other) => {
+                    break Some(CaptureEnd::ProtocolViolation(format!(
+                        "unexpected {:?} during capture",
+                        other.kind()
+                    )));
+                }
+                Err(err) if is_timeout(&err) => break Some(CaptureEnd::TimedOut),
+                Err(_) => break Some(CaptureEnd::Disconnected),
+            }
         };
         stop_flag.store(true, Ordering::SeqCst);
+        if capture_write_error.is_some() {
+            shutdown_capture_writer(writer.as_ref());
+        }
 
         let producer_result = producer
             .join()
             .map_err(|_| WireError::Io(io::Error::other("capture producer thread panicked")))?;
+        if let Some(err) = capture_write_error {
+            return Err(err);
+        }
         producer_result?;
         let batches_sent = batches_sent_counter.load(Ordering::SeqCst);
         let samples_sent = samples_sent_counter.load(Ordering::SeqCst);
@@ -803,6 +950,28 @@ fn run_capture(
             },
         })
     })
+}
+
+/// Serialize complete capture-phase frames. The raw-sample producer and the
+/// request reader both write to the socket, so cloned stream handles alone
+/// are not sufficient to prevent byte-level frame interleaving.
+fn write_capture_messages(
+    writer: &Mutex<UnixStream>,
+    messages: &[Message],
+) -> Result<(), WireError> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| WireError::Io(io::Error::other("capture writer lock poisoned")))?;
+    for message in messages {
+        write_message(&mut *writer, message)?;
+    }
+    Ok(())
+}
+
+fn shutdown_capture_writer(writer: &Mutex<UnixStream>) {
+    if let Ok(writer) = writer.lock() {
+        let _ = writer.shutdown(Shutdown::Both);
+    }
 }
 
 fn is_timeout(error: &WireError) -> bool {
@@ -854,7 +1023,7 @@ mod version_tests {
     use super::compatible_version;
     use wattch_protocol::PROTOCOL_VERSION;
 
-    // PROTOCOL_VERSION is "0.1.0" today; these tests pin the semantics
+    // PROTOCOL_VERSION is "0.2.0" today; these tests pin the semantics
     // (same major+minor accepted regardless of patch, anything else
     // rejected) rather than the literal string, so they keep meaning if it
     // changes.
@@ -866,23 +1035,23 @@ mod version_tests {
 
     #[test]
     fn same_major_minor_different_patch_is_compatible() {
-        assert!(compatible_version("0.1.0"));
-        assert!(compatible_version("0.1.99"));
+        assert!(compatible_version("0.2.0"));
+        assert!(compatible_version("0.2.99"));
     }
 
     #[test]
     fn older_minor_is_incompatible() {
-        assert!(!compatible_version("0.0.9"));
+        assert!(!compatible_version("0.1.9"));
     }
 
     #[test]
     fn newer_minor_is_incompatible() {
-        assert!(!compatible_version("0.2.0"));
+        assert!(!compatible_version("0.3.0"));
     }
 
     #[test]
     fn different_major_is_incompatible() {
-        assert!(!compatible_version("1.1.0"));
+        assert!(!compatible_version("1.2.0"));
     }
 
     #[test]

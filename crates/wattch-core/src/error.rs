@@ -21,4 +21,16 @@ pub enum Error {
 
     #[error("invalid raw sample batch: {0}")]
     InvalidBatch(String),
+
+    #[error("invalid measurement boundary `{boundary_id}`: {reason}")]
+    InvalidMeasurementBoundary { boundary_id: String, reason: String },
+
+    #[error("invalid trial metadata `{trial_id}`: {reason}")]
+    InvalidTrialMetadata { trial_id: String, reason: String },
+
+    #[error("invalid trial quality metadata `{trial_id}`: {reason}")]
+    InvalidTrialQuality { trial_id: String, reason: String },
+
+    #[error("invalid counterfactual impact estimate `{estimate_id}`: {reason}")]
+    InvalidCounterfactualImpactEstimate { estimate_id: String, reason: String },
 }

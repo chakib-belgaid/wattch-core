@@ -1,0 +1,128 @@
+{
+  "scenario_id": "quality_faults_v0",
+  "run_id": "run-quality-faults",
+  "node_id": "deterministic-lab",
+  "tick_ns": 10000000,
+  "ticks": 10,
+  "record_events": [
+    {
+      "event_id": "target-spawn-delayed",
+      "kind": "TARGET_SPAWN",
+      "intended_tick": 1,
+      "record_after_tick": 4,
+      "labels": {
+        "fault": "marker_delay",
+        "intended_tick": "1"
+      }
+    }
+  ],
+  "sources": [
+    {
+      "local_source_id": 1,
+      "source_uid": "det://deterministic-lab/cpu/package/0/energy-wrapped",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "CPU_PACKAGE_ENERGY",
+      "unit": "JOULE",
+      "temporality": "CUMULATIVE",
+      "evidence_class": "RAW_HARDWARE_COUNTER",
+      "source_path": "cpu/package/0/energy-wrapped",
+      "parent_source_uid": null,
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 10000000,
+      "max_value": 100.0,
+      "resolution": 0.001,
+      "labels": { "fault": "counter_wrap" },
+      "behavior": {
+        "type": "wrapped_counter",
+        "start": 95.0,
+        "step_per_tick": 3.0,
+        "modulus": 100.0
+      }
+    },
+    {
+      "local_source_id": 2,
+      "source_uid": "det://deterministic-lab/cpu/package/0/frequency-gapped",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "P_STATE_FREQUENCY",
+      "unit": "HERTZ",
+      "temporality": "GAUGE",
+      "evidence_class": "OS_TELEMETRY",
+      "source_path": "cpu/package/0/frequency-gapped",
+      "parent_source_uid": "det://deterministic-lab/cpu/package/0/energy-wrapped",
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 10000000,
+      "max_value": null,
+      "resolution": 1000000.0,
+      "labels": { "fault": "trace_gap" },
+      "behavior": { "start": 2000000000.0, "step_per_tick": 100000000.0 },
+      "emission": { "skip_ticks": [3, 4] }
+    },
+    {
+      "local_source_id": 3,
+      "source_uid": "det://deterministic-lab/cpu/package/0/temperature-disappearing",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "OTHER",
+      "unit": "CELSIUS",
+      "temporality": "GAUGE",
+      "evidence_class": "RAW_SENSOR_READING",
+      "source_path": "cpu/package/0/temperature-disappearing",
+      "parent_source_uid": "det://deterministic-lab/cpu/package/0/energy-wrapped",
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 10000000,
+      "max_value": 105.0,
+      "resolution": 0.1,
+      "labels": { "fault": "source_disappearance" },
+      "behavior": { "type": "constant", "value": 55.0 },
+      "emission": { "stop_after_tick": 5 }
+    },
+    {
+      "local_source_id": 5,
+      "source_uid": "det://deterministic-lab/scheduler/wakeups-drifting-clock",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "WAKEUP_COUNTER",
+      "unit": "COUNTER",
+      "temporality": "CUMULATIVE",
+      "evidence_class": "OS_TELEMETRY",
+      "source_path": "scheduler/wakeups-drifting-clock",
+      "parent_source_uid": null,
+      "clock_domain": "synthetic-drifting",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 10000000,
+      "max_value": null,
+      "resolution": 1.0,
+      "labels": {
+        "fault": "clock_drift",
+        "simulation_scope": "dry_run_replay_only"
+      },
+      "behavior": { "start": 1000.0, "step_per_tick": 10.0 },
+      "timestamp": { "drift_ns_per_tick": 100000, "jitter_ns": [0, 1000, -1000] }
+    },
+    {
+      "local_source_id": 6,
+      "source_uid": "det://deterministic-lab/gpu/0/power-aliased",
+      "node_id": "deterministic-lab",
+      "backend": "deterministic",
+      "kind": "GPU_POWER",
+      "unit": "WATT",
+      "temporality": "INSTANT",
+      "evidence_class": "RAW_SENSOR_READING",
+      "source_path": "gpu/0/power-aliased",
+      "parent_source_uid": null,
+      "clock_domain": "monotonic",
+      "sampling_mode": "SYNTHETIC",
+      "nominal_period_ns": 20000000,
+      "max_value": null,
+      "resolution": 0.1,
+      "labels": { "fault": "sampling_alias" },
+      "behavior": { "type": "sequence", "values": [0.0, 100.0], "repeat": true },
+      "emission": { "every_n_ticks": 2 }
+    }
+  ]
+}

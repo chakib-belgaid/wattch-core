@@ -1,24 +1,31 @@
-"""Blocking Wattch protocol v0.1 client over a Unix socket."""
+"""Blocking Wattch protocol v0.2 client over a Unix socket."""
 
 from __future__ import annotations
 
 import math
 import os
 import socket
+import threading
 import time
-from typing import Callable, Iterator
+import unicodedata
+from collections import deque
+from typing import Callable, Iterator, Mapping
 
 from ._frames import FrameKind, read_frame, write_frame
 from ._messages import (
     PROTOCOL_VERSION,
     ErrorMessage,
+    Event,
+    EventBatch,
     HelloResponse,
     RawSampleBatch,
+    RecordEventAck,
     SourceDescriptor,
     StartCaptureAck,
     StopCaptureAck,
     decode_payload,
     encode_hello_request,
+    encode_record_event,
     encode_start_capture,
     encode_stop_capture,
 )
@@ -39,6 +46,14 @@ MAX_RUN_ID_BYTES = 256
 CONTROL_TIMEOUT_S = 5.0
 STOP_GRACE_S = 5.0
 CAPTURE_BATCH_SLACK = 64
+
+
+def _compatible_protocol_version(daemon_version: str) -> bool:
+    """Live v0 accepts patch differences within the same major/minor."""
+
+    daemon_parts = daemon_version.split(".")
+    client_parts = PROTOCOL_VERSION.split(".")
+    return daemon_parts[:2] == client_parts[:2] and len(daemon_parts) >= 2
 
 
 def _first_existing(
@@ -116,9 +131,26 @@ class WattchClient:
         self._active_run_id: str | None = None
         self._accepted_source_ids: frozenset[int] = frozenset()
         self._last_batch_sequence_no: int | None = None
+        self._last_event_batch_sequence_no: int | None = None
+        self._last_event_monotonic_ns: int | None = None
         self._sample_positions: dict[int, tuple[int, int]] = {}
+        self._events_by_id: dict[str, Event] = {}
         self._batches_seen = 0
         self._samples_seen = 0
+        self._pending_raw_batches: deque[RawSampleBatch] = deque()
+        self._pending_event_batches: deque[EventBatch] = deque()
+
+        # Callback capture mode owns the only socket reader. Control methods
+        # write requests and wait for that reader to dispatch the matching ack.
+        self._write_lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._reader_condition = threading.Condition()
+        self._reader_thread: threading.Thread | None = None
+        self._reader_error: BaseException | None = None
+        self._event_acks: dict[str, RecordEventAck] = {}
+        self._stop_ack: StopCaptureAck | None = None
+        self._on_raw_batch: Callable[[RawSampleBatch], None] | None = None
+        self._on_event_batch: Callable[[EventBatch], None] | None = None
 
         # Close the socket if the handshake fails midway, so a rejected or
         # malformed Hello doesn't leak the fd on a client we can't return.
@@ -149,6 +181,14 @@ class WattchClient:
     def node_id(self) -> str:
         return self.hello.node_id
 
+    @property
+    def protocol_version(self) -> str:
+        return self.hello.protocol_version
+
+    @property
+    def clock_instance_id(self) -> str:
+        return self.hello.clock_instance_id
+
     def source_by_id(self, source_id: int) -> SourceDescriptor:
         for source in self.hello.sources:
             if source.local_source_id == source_id:
@@ -162,6 +202,9 @@ class WattchClient:
         run_id: str,
         interval_ms: int = 50,
         source_ids: list[int] | None = None,
+        *,
+        on_raw_batch: Callable[[RawSampleBatch], None] | None = None,
+        on_event_batch: Callable[[EventBatch], None] | None = None,
     ) -> StartCaptureAck:
         self._validate_run_id(run_id)
         if self._active_run_id is not None:
@@ -203,14 +246,37 @@ class WattchClient:
         self._active_run_id = run_id
         self._accepted_source_ids = frozenset(accepted)
         self._last_batch_sequence_no = None
+        self._last_event_batch_sequence_no = None
+        self._last_event_monotonic_ns = None
         self._sample_positions = {}
+        self._events_by_id = {}
         self._batches_seen = 0
         self._samples_seen = 0
+        self._pending_raw_batches.clear()
+        self._pending_event_batches.clear()
+        self._reader_error = None
+        self._event_acks = {}
+        self._stop_ack = None
+        self._on_raw_batch = on_raw_batch
+        self._on_event_batch = on_event_batch
         self._sock.settimeout(max(CONTROL_TIMEOUT_S, 3 * interval_ms / 1000.0))
+        if on_raw_batch is not None or on_event_batch is not None:
+            self._reader_thread = threading.Thread(
+                target=self._capture_reader_loop,
+                name=f"pywattch-{run_id}",
+                daemon=True,
+            )
+            self._reader_thread.start()
         return ack
 
     def read_batch(self) -> RawSampleBatch | StopCaptureAck:
         """Read the next data-plane message during an active capture."""
+        if self._reader_thread is not None:
+            raise WattchProtocolError(
+                "read_batch is unavailable while callback capture mode owns the reader"
+            )
+        if self._pending_raw_batches:
+            return self._pending_raw_batches.popleft()
         kind, payload = read_frame(self._sock)
         message = decode_payload(kind, payload)
         if isinstance(message, ErrorMessage):
@@ -226,6 +292,49 @@ class WattchClient:
             f"unexpected {kind.name} during capture, expected RawSampleBatch or StopCaptureAck"
         )
 
+    def take_event_batches(self) -> list[EventBatch]:
+        """Return and clear event batches accumulated by synchronous requests."""
+
+        batches = list(self._pending_event_batches)
+        self._pending_event_batches.clear()
+        return batches
+
+    def record_event(
+        self,
+        run_id: str,
+        event_id: str,
+        kind: str,
+        labels: Mapping[str, str] | None = None,
+    ) -> RecordEventAck:
+        """Ask the daemon to timestamp one marker in its monotonic clock.
+
+        The daemon emits the authoritative singleton ``EventBatch`` before the
+        matching acknowledgement. In synchronous mode any raw batches seen
+        while waiting are buffered for ``read_batch``; in callback mode the
+        sole reader thread dispatches them normally.
+        """
+
+        self._validate_record_event(run_id, event_id, kind, labels)
+        if run_id != self._active_run_id:
+            raise WattchProtocolError(
+                f"cannot record event for run {run_id!r}; active run is "
+                f"{self._active_run_id!r}"
+            )
+        normalized_labels = dict(labels or {})
+        with self._control_lock:
+            payload = encode_record_event(run_id, event_id, kind, normalized_labels)
+            if self._reader_thread is not None:
+                with self._write_lock:
+                    write_frame(self._sock, FrameKind.RECORD_EVENT, payload)
+                ack = self._wait_for_event_ack(event_id)
+            else:
+                write_frame(self._sock, FrameKind.RECORD_EVENT, payload)
+                ack = self._read_record_event_exchange(event_id)
+        self._validate_requested_event(
+            ack.event, run_id, event_id, kind, normalized_labels
+        )
+        return ack
+
     def stop_capture(
         self, run_id: str, max_drained_batches: int = CAPTURE_BATCH_SLACK
     ) -> tuple[StopCaptureAck, list[RawSampleBatch]]:
@@ -236,6 +345,17 @@ class WattchClient:
             )
         if max_drained_batches < 0:
             raise ValueError("max_drained_batches must not be negative")
+        if self._reader_thread is not None:
+            with self._control_lock:
+                with self._write_lock:
+                    write_frame(
+                        self._sock, FrameKind.STOP_CAPTURE, encode_stop_capture(run_id)
+                    )
+                ack = self._wait_for_stop_ack()
+            self._join_reader()
+            self._clear_capture()
+            return ack, []
+
         write_frame(self._sock, FrameKind.STOP_CAPTURE, encode_stop_capture(run_id))
         self._sock.settimeout(STOP_GRACE_S)
         drained: list[RawSampleBatch] = []
@@ -335,9 +455,14 @@ class WattchClient:
 
     def close(self) -> None:
         try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
             self._sock.close()
         except OSError:
             pass
+        self._join_reader()
         self._clear_capture()
 
     def __enter__(self) -> "WattchClient":
@@ -347,6 +472,105 @@ class WattchClient:
         self.close()
 
     # -- internals ----------------------------------------------------------
+
+    def _capture_reader_loop(self) -> None:
+        try:
+            while self._active_run_id is not None:
+                kind, payload = read_frame(self._sock)
+                message = decode_payload(kind, payload)
+                if isinstance(message, ErrorMessage):
+                    raise WattchDaemonError(message.code, message.message)
+                if isinstance(message, RawSampleBatch):
+                    self._validate_batch(message)
+                    if self._on_raw_batch is not None:
+                        self._on_raw_batch(message)
+                    continue
+                if isinstance(message, EventBatch):
+                    self._validate_event_batch(message)
+                    if self._on_event_batch is not None:
+                        self._on_event_batch(message)
+                    continue
+                if isinstance(message, RecordEventAck):
+                    self._validate_event_ack(message)
+                    with self._reader_condition:
+                        self._event_acks[message.event.event_id] = message
+                        self._reader_condition.notify_all()
+                    continue
+                if isinstance(message, StopCaptureAck):
+                    self._validate_stop_ack(message)
+                    with self._reader_condition:
+                        self._stop_ack = message
+                        self._reader_condition.notify_all()
+                    return
+                raise WattchProtocolError(
+                    f"unexpected {kind.name} during callback capture"
+                )
+        except BaseException as error:
+            with self._reader_condition:
+                self._reader_error = error
+                self._reader_condition.notify_all()
+
+    def _read_record_event_exchange(self, event_id: str) -> RecordEventAck:
+        while True:
+            kind, payload = read_frame(self._sock)
+            message = decode_payload(kind, payload)
+            if isinstance(message, ErrorMessage):
+                raise WattchDaemonError(message.code, message.message)
+            if isinstance(message, RawSampleBatch):
+                self._validate_batch(message)
+                self._pending_raw_batches.append(message)
+                continue
+            if isinstance(message, EventBatch):
+                self._validate_event_batch(message)
+                self._pending_event_batches.append(message)
+                continue
+            if isinstance(message, RecordEventAck):
+                self._validate_event_ack(message)
+                if message.event.event_id != event_id:
+                    raise WattchProtocolError(
+                        f"RecordEventAck event_id {message.event.event_id!r} does not "
+                        f"match {event_id!r}"
+                    )
+                return message
+            raise WattchProtocolError(
+                f"unexpected {kind.name} while waiting for RecordEventAck"
+            )
+
+    def _wait_for_event_ack(self, event_id: str) -> RecordEventAck:
+        deadline = time.monotonic() + CONTROL_TIMEOUT_S
+        with self._reader_condition:
+            while event_id not in self._event_acks:
+                self._raise_reader_error_locked()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WattchProtocolError(
+                        f"daemon did not acknowledge event {event_id!r} before the deadline"
+                    )
+                self._reader_condition.wait(remaining)
+            return self._event_acks.pop(event_id)
+
+    def _wait_for_stop_ack(self) -> StopCaptureAck:
+        deadline = time.monotonic() + STOP_GRACE_S
+        with self._reader_condition:
+            while self._stop_ack is None:
+                self._raise_reader_error_locked()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WattchProtocolError(
+                        "daemon did not acknowledge StopCapture before the deadline"
+                    )
+                self._reader_condition.wait(remaining)
+            return self._stop_ack
+
+    def _raise_reader_error_locked(self) -> None:
+        if self._reader_error is not None:
+            raise self._reader_error
+
+    def _join_reader(self) -> None:
+        reader = self._reader_thread
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=CONTROL_TIMEOUT_S)
+        self._reader_thread = None
 
     def _read_expected(self, expected: FrameKind, name: str):
         kind, payload = read_frame(self._sock)
@@ -358,13 +582,17 @@ class WattchClient:
         return message
 
     def _validate_hello(self) -> None:
-        if self.hello.protocol_version != PROTOCOL_VERSION:
+        if not _compatible_protocol_version(self.hello.protocol_version):
             raise WattchProtocolError(
-                f"daemon protocol {self.hello.protocol_version!r} does not match "
+                f"daemon protocol {self.hello.protocol_version!r} is not compatible with "
                 f"client protocol {PROTOCOL_VERSION!r}"
             )
         if not self.hello.node_id.strip():
             raise WattchProtocolError("HelloResponse node_id must not be empty")
+        if not self.hello.clock_instance_id.strip():
+            raise WattchProtocolError(
+                "HelloResponse clock_instance_id must not be empty in protocol v0.2"
+            )
         ids: set[int] = set()
         uids: set[str] = set()
         for source in self.sources:
@@ -414,6 +642,129 @@ class WattchClient:
             raise WattchProtocolError("run_id exceeds 256 UTF-8 bytes")
         if any(ord(character) < 32 or ord(character) == 127 for character in run_id):
             raise WattchProtocolError("run_id must not contain control characters")
+
+    @classmethod
+    def _validate_record_event(
+        cls,
+        run_id: str,
+        event_id: str,
+        kind: str,
+        labels: Mapping[str, str] | None,
+    ) -> None:
+        cls._validate_run_id(run_id)
+        cls._validate_event_text(event_id, "event_id", 256)
+        cls._validate_event_text(kind, "event kind", 256)
+        if labels is None:
+            return
+        if not isinstance(labels, Mapping):
+            raise WattchProtocolError("event labels must be a mapping")
+        if len(labels) > 64:
+            raise WattchProtocolError("event labels exceed 64 entries")
+        for key, value in labels.items():
+            cls._validate_event_text(key, "event label key", 128)
+            if not isinstance(value, str):
+                raise WattchProtocolError("event label values must be strings")
+            if len(value.encode("utf-8")) > 1024:
+                raise WattchProtocolError(
+                    "event label value exceeds 1024 UTF-8 bytes"
+                )
+            if cls._contains_control(value):
+                raise WattchProtocolError(
+                    "event label value must not contain control characters"
+                )
+
+    @classmethod
+    def _validate_event_text(cls, value: object, field_name: str, limit: int) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise WattchProtocolError(f"{field_name} must not be empty")
+        if len(value.encode("utf-8")) > limit:
+            raise WattchProtocolError(
+                f"{field_name} exceeds {limit} UTF-8 bytes"
+            )
+        if cls._contains_control(value):
+            raise WattchProtocolError(
+                f"{field_name} must not contain control characters"
+            )
+
+    @staticmethod
+    def _contains_control(value: str) -> bool:
+        return any(unicodedata.category(character) == "Cc" for character in value)
+
+    def _validate_event_batch(self, batch: EventBatch) -> None:
+        if self._active_run_id is None:
+            raise WattchProtocolError("EventBatch arrived without an active capture")
+        if batch.run_id != self._active_run_id:
+            raise WattchProtocolError(
+                f"event batch run_id {batch.run_id!r} does not match "
+                f"{self._active_run_id!r}"
+            )
+        if batch.node_id != self.node_id:
+            raise WattchProtocolError(
+                f"event batch node_id {batch.node_id!r} does not match {self.node_id!r}"
+            )
+        self._require_uint(batch.batch_sequence_no, 64, "event batch_sequence_no")
+        if (
+            self._last_event_batch_sequence_no is not None
+            and batch.batch_sequence_no <= self._last_event_batch_sequence_no
+        ):
+            raise WattchProtocolError("event batch sequence replay or reordering detected")
+
+        staged: list[Event] = []
+        seen_in_batch: set[str] = set()
+        last_monotonic_ns = self._last_event_monotonic_ns
+        for event in batch.events:
+            self._validate_record_event(
+                event.run_id, event.event_id, event.kind, event.labels
+            )
+            if event.run_id != batch.run_id or event.node_id != batch.node_id:
+                raise WattchProtocolError(
+                    "event identity does not match its EventBatch envelope"
+                )
+            self._require_uint(event.monotonic_ns, 64, "event.monotonic_ns")
+            if event.event_id in self._events_by_id or event.event_id in seen_in_batch:
+                raise WattchProtocolError(
+                    f"duplicate event_id {event.event_id!r} in capture stream"
+                )
+            if last_monotonic_ns is not None and event.monotonic_ns < last_monotonic_ns:
+                raise WattchProtocolError("event monotonic timestamp regressed")
+            seen_in_batch.add(event.event_id)
+            staged.append(event)
+            last_monotonic_ns = event.monotonic_ns
+
+        self._last_event_batch_sequence_no = batch.batch_sequence_no
+        self._last_event_monotonic_ns = last_monotonic_ns
+        for event in staged:
+            self._events_by_id[event.event_id] = event
+
+    def _validate_event_ack(self, ack: RecordEventAck) -> None:
+        event = ack.event
+        authoritative = self._events_by_id.get(event.event_id)
+        if authoritative is None:
+            raise WattchProtocolError(
+                "RecordEventAck arrived before its authoritative EventBatch"
+            )
+        if event != authoritative:
+            raise WattchProtocolError(
+                "RecordEventAck event does not match its authoritative EventBatch"
+            )
+
+    @staticmethod
+    def _validate_requested_event(
+        event: Event,
+        run_id: str,
+        event_id: str,
+        kind: str,
+        labels: Mapping[str, str],
+    ) -> None:
+        if (
+            event.run_id != run_id
+            or event.event_id != event_id
+            or event.kind != kind
+            or event.labels != dict(labels)
+        ):
+            raise WattchProtocolError(
+                "RecordEventAck does not match the requested event fields"
+            )
 
     def _validate_batch(self, batch: RawSampleBatch) -> None:
         if self._active_run_id is None:
@@ -491,7 +842,14 @@ class WattchClient:
         self._active_run_id = None
         self._accepted_source_ids = frozenset()
         self._last_batch_sequence_no = None
+        self._last_event_batch_sequence_no = None
+        self._last_event_monotonic_ns = None
         self._sample_positions = {}
+        self._events_by_id = {}
+        self._event_acks = {}
+        self._stop_ack = None
+        self._on_raw_batch = None
+        self._on_event_batch = None
         if self._sock.fileno() >= 0:
             self._sock.settimeout(CONTROL_TIMEOUT_S)
 

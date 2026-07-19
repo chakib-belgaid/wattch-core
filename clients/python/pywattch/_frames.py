@@ -4,11 +4,11 @@ Frame layout (little-endian):
 
     magic            4 bytes  b"WCH0"
     wire major       u16      0
-    wire minor       u16      1
+    wire minor       u16      2
     frame kind       u16
     flags            u16
     payload length   u32
-    payload          length bytes (JSON in v0.1)
+    payload          length bytes (JSON in v0.1 and v0.2)
 """
 
 from __future__ import annotations
@@ -23,8 +23,12 @@ from .errors import WattchConnectionError, WattchProtocolError
 MAGIC = b"WCH0"
 HEADER_LEN = 16
 WIRE_VERSION_MAJOR = 0
-WIRE_VERSION_MINOR = 1
+WIRE_VERSION_MINOR = 2
+MIN_READABLE_WIRE_VERSION_MINOR = 1
 MAX_PAYLOAD_LEN = 16 * 1024 * 1024
+# Offline migration bound for historical v0.1 trace batches. Live socket I/O
+# never uses this larger limit.
+MAX_LEGACY_ARTIFACT_PAYLOAD_LEN = MAX_PAYLOAD_LEN * 16
 
 _HEADER = struct.Struct("<4sHHHHI")
 
@@ -36,6 +40,8 @@ class FrameKind(IntEnum):
     STOP_CAPTURE = 4
     START_CAPTURE_ACK = 5
     STOP_CAPTURE_ACK = 6
+    RECORD_EVENT = 7
+    RECORD_EVENT_ACK = 8
     RAW_SAMPLE_BATCH = 10
     EVENT_BATCH = 11
     ERROR = 255
@@ -50,20 +56,34 @@ def encode_frame(kind: FrameKind, payload: bytes, flags: int = 0) -> bytes:
     return header + payload
 
 
-def decode_header(buf: bytes) -> tuple[FrameKind, int, int]:
-    """Return (kind, flags, payload_len) for a 16-byte header."""
+def decode_header(
+    buf: bytes, *, max_payload_len: int = MAX_PAYLOAD_LEN
+) -> tuple[FrameKind, int, int]:
+    """Return ``(kind, flags, payload_len)`` for a 16-byte header.
+
+    Live callers use the default 16 MiB bound. Offline legacy-artifact
+    readers may pass a larger finite migration bound explicitly.
+    """
     if len(buf) < HEADER_LEN:
         raise WattchProtocolError("buffer too short for frame header")
     magic, major, minor, raw_kind, flags, payload_len = _HEADER.unpack(buf[:HEADER_LEN])
     if magic != MAGIC:
         raise WattchProtocolError("invalid magic bytes")
-    if (major, minor) != (WIRE_VERSION_MAJOR, WIRE_VERSION_MINOR):
+    if major != WIRE_VERSION_MAJOR or not (
+        MIN_READABLE_WIRE_VERSION_MINOR <= minor <= WIRE_VERSION_MINOR
+    ):
         raise WattchProtocolError(f"unsupported wire version {major}.{minor}")
     try:
         kind = FrameKind(raw_kind)
     except ValueError as exc:
         raise WattchProtocolError(f"unknown frame kind: {raw_kind}") from exc
-    if payload_len > MAX_PAYLOAD_LEN:
+    if minor < 2 and kind in {
+        FrameKind.RECORD_EVENT,
+        FrameKind.RECORD_EVENT_ACK,
+        FrameKind.EVENT_BATCH,
+    }:
+        raise WattchProtocolError(f"{kind.name} requires wire version 0.2")
+    if payload_len > max_payload_len:
         raise WattchProtocolError(f"payload too large: {payload_len} bytes")
     return kind, flags, payload_len
 

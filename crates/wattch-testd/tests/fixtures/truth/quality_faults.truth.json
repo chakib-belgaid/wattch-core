@@ -1,0 +1,19 @@
+{
+  "scenario_file": "quality_faults.json",
+  "expected": {
+    "wrapped_source_id": 1,
+    "wrapped_prefix": [95.0, 98.0, 1.0],
+    "gapped_source_id": 2,
+    "missing_ticks": [3, 4],
+    "disappearing_source_id": 3,
+    "last_present_tick": 5,
+    "delayed_marker_event_id": "target-spawn-delayed",
+    "marker_intended_tick": 1,
+    "marker_record_after_tick": 4,
+    "drifting_source_id": 5,
+    "tick_9_timestamp_ns": 90900000,
+    "aliased_source_id": 6,
+    "aliased_observed_value": 0.0
+  },
+  "claim": "quality failures are raw deterministic evidence, not daemon interpretations"
+}

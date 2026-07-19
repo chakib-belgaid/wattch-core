@@ -1,0 +1,18 @@
+{
+  "scenario_file": "causal_treatment_timing_confounding.json",
+  "primary_source_id": 1,
+  "windows": {
+    "quiet_control": { "start_tick": 0, "end_tick": 4 },
+    "busy_control": { "start_tick": 4, "end_tick": 8 },
+    "quiet_treatment": { "start_tick": 8, "end_tick": 12 },
+    "busy_treatment": { "start_tick": 12, "end_tick": 16 }
+  },
+  "expected": {
+    "quiet_treatment_joules": 6.0,
+    "busy_treatment_joules": 10.0,
+    "naive_busy_minus_quiet_joules": 4.0,
+    "quiet_incremental_joules": 2.0,
+    "busy_incremental_joules": 2.0
+  },
+  "claim": "launching the same treatment in different background phases creates a raw-energy difference that vanishes after matched control subtraction"
+}

@@ -1,14 +1,55 @@
 [benchmark]
 name = "polling-vs-batching"
-workload = "synthetic-background-interference"
+workload = "deterministic-arrival-paced-batch-consumer"
+
+[workload]
+workload_mode = "BATCH"
+input_id = "wattch-polling-batching-v1"
+arrival_trace = "SplitMix64 permutation from the runner-injected WATTCH_REPLAY_SEED"
+items = 4096
+arrival_interval_ms = 2
+work_rounds = 64
+work_unit = "items"
+timeout_s = 20
+producer_lateness_limit_ms = 20
+canonical_output_sha256 = "3d0a3a98c688cfa35fd326bb5007ccb81723c6eea5d68234ec6e39b9bf911e08"
+metrics_contract = "runner injects WATTCH_METRICS_PATH for one exclusively-created target.metrics.json record"
+
+[versions.sham]
+label = "arrival-harness-sham"
+command = ["python3", "examples/workloads/polling_batching_worker.py", "--mode", "sham", "--items", "4096", "--arrival-interval-ms", "2", "--batch-size", "32", "--work-rounds", "64", "--timeout-s", "20", "--latency-slo-ms", "1000", "--producer-lateness-limit-ms", "20"]
+role = "C0 drains the same arrivals without executing the task computation"
 
 [versions.batching]
 label = "batching"
-command = "./examples/workloads/batching-worker"
+command = ["python3", "examples/workloads/polling_batching_worker.py", "--mode", "batching", "--items", "4096", "--arrival-interval-ms", "2", "--batch-size", "32", "--work-rounds", "64", "--timeout-s", "20", "--latency-slo-ms", "1000", "--producer-lateness-limit-ms", "20"]
+expected_output_sha256 = "3d0a3a98c688cfa35fd326bb5007ccb81723c6eea5d68234ec6e39b9bf911e08"
+wait_strategy = "blocking reads with 32-item dispatch batches"
 
 [versions.polling]
 label = "polling"
-command = "./examples/workloads/polling-worker"
+command = ["python3", "examples/workloads/polling_batching_worker.py", "--mode", "polling", "--items", "4096", "--arrival-interval-ms", "2", "--batch-size", "32", "--work-rounds", "64", "--timeout-s", "20", "--latency-slo-ms", "1000", "--producer-lateness-limit-ms", "20"]
+expected_output_sha256 = "3d0a3a98c688cfa35fd326bb5007ccb81723c6eea5d68234ec6e39b9bf911e08"
+wait_strategy = "tight non-blocking reads without sleep"
+
+[background]
+label = "deterministic-batching-co-tenant"
+command = ["python3", "examples/workloads/polling_batching_worker.py", "--mode", "batching", "--items", "6000", "--arrival-interval-ms", "2", "--batch-size", "16", "--work-rounds", "256", "--timeout-s", "20", "--latency-slo-ms", "1000", "--producer-lateness-limit-ms", "20"]
+same_command_for_all_arms = true
+note = "example controlled co-tenant; freeze placement and validate its output before a trial"
+
+[arms]
+c0 = "background plus versions.sham"
+c1 = "background plus versions.batching"
+c2 = "background plus versions.polling"
+
+[measurement]
+aggregation_rule = "SINGLE_SOURCE"
+primary_source_uid = "select-and-freeze-from-wattch-powerd-discovery"
+
+[estimands]
+fixed_horizon = true
+equal_work = true
 
 [phases]
 warmup_s = 5
@@ -16,15 +57,30 @@ measurement_s = 30
 cooldown_s = 20
 
 [repetitions]
-count = 10
-ordering = "paired-randomized"
+pilot_blocks = 12
+pilot_disposition = "discarded"
+ordering = "position-balanced-c0-c1-c2-triples"
+confirmatory_blocks = "determine-from-pilot-for-90-percent-power"
 
 [signals]
-include_direct_energy = true
+primary_energy = "one-preregistered-measurement-boundary"
 include_gpu_power = true
 include_wakeups = true
 include_cstates = true
 include_idle_recovery = true
 
+[mechanism]
+policies = ["NORMAL_DYNAMIC", "FIXED_NON_TURBO"]
+restricted_deep_idle_replication = "run a separate schedule with NORMAL_DYNAMIC and RESTRICTED_DEEP_IDLE"
+target_nice_levels = [0, 10]
+host_policy_controller = "required-and-platform-specific-before-running"
+verification = "record exact settings and SHA-256 fingerprint for every intervention"
+
 [notes]
-status = "spec only; benchmark layer not implemented in the starting phase"
+status = "runnable workload scaffold; no empirical result or energy claim"
+workload_commands_runnable = true
+confirmatory_run_ready = false
+reason = "discover and freeze the daemon boundary, calibrate its interval, bind a host-policy controller, and complete the discarded pilot first"
+output_equivalence = "batching and polling stdout are byte-identical; C0 sham is intentionally excluded"
+metrics = "seal and parse the runner-injected target.metrics.json into WorkloadMetrics"
+format = "human-readable preregistration sketch; translate to pywattch ExperimentConfig"

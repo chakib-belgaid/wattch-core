@@ -2,17 +2,35 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use wattch_daemon::{DaemonIdentity, PeerPolicy, SampleBackend, ServerConfig, SocketSource};
+use wattch_powerd::composite::{CloneSampleBackend, CompositeBackend};
+use wattch_powerd::linux_os::{LinuxOsBackend, LinuxOsPaths};
+use wattch_powerd::powermetrics::PowermetricsBackend;
 use wattch_powerd::rapl::RaplBackend;
 use wattch_powerd::synthetic::SyntheticBackend;
 
+type BackendFactory = Box<dyn Fn() -> Box<dyn SampleBackend> + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum BackendChoice {
-    /// Pick linux-rapl when a powercap tree exists, otherwise synthetic.
+    /// Pick apple-powermetrics on macOS, linux-rapl when available on Linux,
+    /// otherwise synthetic.
     Auto,
     /// Linux RAPL via the powercap sysfs interface (usually needs privilege).
     LinuxRapl,
+    /// Apple powermetrics CPU/GPU/ANE estimates (macOS, requires root).
+    ApplePowermetrics,
     /// Deterministic synthetic laptop topology, no privilege required.
     Synthetic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OsTelemetryChoice {
+    /// Include Linux OS telemetry when supported, otherwise continue without it.
+    Auto,
+    /// Require Linux OS telemetry and fail startup when no source is available.
+    On,
+    /// Expose only the selected power/energy backend.
+    Off,
 }
 
 #[derive(Debug, Parser)]
@@ -21,10 +39,9 @@ enum BackendChoice {
 struct Args {
     /// Unix socket path to serve the Wattch protocol on.
     ///
-    /// Defaults to (in order of preference): /run/wattch/wattch-powerd.sock
-    /// when running as root, $XDG_RUNTIME_DIR/wattch/wattch-powerd.sock, or
-    /// a per-uid path under /tmp. Clients only auto-discover the first two;
-    /// pass --socket explicitly when using /tmp. See docs/powerd.md.
+    /// Defaults to the platform root runtime directory when running as root,
+    /// then $XDG_RUNTIME_DIR/wattch, then a per-uid path under /tmp. Clients
+    /// do not auto-discover /tmp. See docs/powerd.md.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -35,6 +52,11 @@ struct Args {
     #[arg(long, default_value = "/sys/class/powercap")]
     powercap_root: PathBuf,
 
+    /// Native powermetrics collection interval in milliseconds. Client
+    /// intervals may be faster, but only fresh Apple samples are emitted.
+    #[arg(long, default_value_t = 1_000)]
+    powermetrics_interval_ms: u64,
+
     /// Node identity recorded in source descriptors.
     #[arg(long, default_value = "local-node")]
     node_id: String,
@@ -42,6 +64,26 @@ struct Args {
     /// Seed for the synthetic backend.
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    /// Compose raw Linux scheduler/CPU-state/thermal/wakeup sources with the powermeter.
+    #[arg(long, value_enum, default_value_t = OsTelemetryChoice::Auto)]
+    os_telemetry: OsTelemetryChoice,
+
+    /// Linux proc-stat path (overridable for containers and tests).
+    #[arg(long, default_value = "/proc/stat")]
+    proc_stat: PathBuf,
+
+    /// Linux CPU sysfs root (overridable for containers and tests).
+    #[arg(long, default_value = "/sys/devices/system/cpu")]
+    cpu_sysfs_root: PathBuf,
+
+    /// Linux thermal sysfs root (overridable for containers and tests).
+    #[arg(long, default_value = "/sys/class/thermal")]
+    thermal_sysfs_root: PathBuf,
+
+    /// Linux sysfs root containing per-source wakeup event counters.
+    #[arg(long, default_value = "/sys/class/wakeup")]
+    wakeup_sources_root: PathBuf,
 
     /// Additional uid allowed to connect (repeatable). uid 0 and the
     /// daemon's own effective uid are always allowed.
@@ -66,7 +108,9 @@ fn main() -> Result<()> {
 
     let backend = match args.backend {
         BackendChoice::Auto => {
-            if args.powercap_root.is_dir()
+            if cfg!(target_os = "macos") {
+                BackendChoice::ApplePowermetrics
+            } else if args.powercap_root.is_dir()
                 && RaplBackend::new(&args.powercap_root, &args.node_id).is_ok()
             {
                 BackendChoice::LinuxRapl
@@ -81,25 +125,48 @@ fn main() -> Result<()> {
         explicit => explicit,
     };
 
-    // Scan the powercap tree once so misconfiguration fails at startup, not
-    // per connection, and so every connection shares the same probed zone
-    // list (`RaplBackend` is a cheap `Clone` of already-read data) instead
-    // of re-scanning powercap on each new connection. If the powercap tree
-    // disappears later (module unload, permission change), that surfaces as
-    // per-sample read errors on the existing skip-with-warn path in
-    // `RaplBackend::sample`, not a re-scan and not a panic.
-    let make_backend: Box<dyn Fn() -> Box<dyn SampleBackend> + Send + Sync> = match backend {
+    let linux_os_paths = LinuxOsPaths {
+        proc_stat: args.proc_stat.clone(),
+        cpu_root: args.cpu_sysfs_root.clone(),
+        thermal_root: args.thermal_sysfs_root.clone(),
+        wakeup_root: args.wakeup_sources_root.clone(),
+    };
+    let os_telemetry = match args.os_telemetry {
+        OsTelemetryChoice::Off => None,
+        OsTelemetryChoice::On => Some(
+            LinuxOsBackend::new(linux_os_paths, &args.node_id)
+                .context("required Linux OS telemetry unavailable")?,
+        ),
+        OsTelemetryChoice::Auto => match LinuxOsBackend::new(linux_os_paths, &args.node_id) {
+            Ok(backend) => Some(backend),
+            Err(error) => {
+                tracing::info!(error = %error, "Linux OS telemetry unavailable; continuing");
+                None
+            }
+        },
+    };
+
+    // Probe and validate the full source composition once. Each connection
+    // then receives a clone of that prototype, so invalid descriptors fail
+    // startup instead of panicking inside the server's infallible factory.
+    let make_backend: BackendFactory = match backend {
         BackendChoice::LinuxRapl => {
             let probed = RaplBackend::new(&args.powercap_root, &args.node_id)
                 .context("linux-rapl backend unavailable")?;
-            Box::new(move || Box::new(probed.clone()))
+            make_backend_factory(probed, os_telemetry.clone())?
+        }
+        BackendChoice::ApplePowermetrics => {
+            let probed = PowermetricsBackend::new(&args.node_id, args.powermetrics_interval_ms)
+                .context(
+                    "apple-powermetrics backend unavailable; on macOS run wattch-powerd as root",
+                )?;
+            make_backend_factory(probed, os_telemetry.clone())?
         }
         BackendChoice::Synthetic => {
-            let node_id = args.node_id.clone();
-            let seed = args.seed;
-            Box::new(move || Box::new(SyntheticBackend::new(&node_id, seed)))
+            let probed = SyntheticBackend::new(&args.node_id, args.seed);
+            make_backend_factory(probed, os_telemetry.clone())?
         }
-        BackendChoice::Auto => unreachable!("auto resolved above"),
+        BackendChoice::Auto => anyhow::bail!("automatic backend selection remained unresolved"),
     };
 
     // systemd socket activation: if systemd handed us a pre-bound socket
@@ -162,4 +229,21 @@ fn main() -> Result<()> {
     let _ = stop_rx.recv();
     handle.shutdown();
     Ok(())
+}
+
+fn make_backend_factory<B>(
+    powermeter: B,
+    os_telemetry: Option<LinuxOsBackend>,
+) -> Result<BackendFactory>
+where
+    B: SampleBackend + Clone + Sync + 'static,
+{
+    let Some(os_telemetry) = os_telemetry else {
+        return Ok(Box::new(move || Box::new(powermeter.clone())));
+    };
+    let children: Vec<Box<dyn CloneSampleBackend>> =
+        vec![Box::new(powermeter), Box::new(os_telemetry)];
+    let prototype = CompositeBackend::new(children)
+        .context("powermeter and OS telemetry descriptors cannot be composed")?;
+    Ok(Box::new(move || Box::new(prototype.clone())))
 }

@@ -26,6 +26,7 @@ Repository = "https://github.com/chakib-belgaid/wattch-core"
 wattch-energytest = "pywattch.energytest.__main__:main"
 
 [project.optional-dependencies]
+analysis = ["pyarrow>=15"]
 profiler = ["pyinstrument>=4.6"]
 dev = ["pytest>=8", "pyinstrument>=4.6"]
 

@@ -1,0 +1,19 @@
+{
+  "scenario_file": "causal_low_priority_dvfs.json",
+  "primary_source_id": 1,
+  "work_source_id": 4,
+  "windows": {
+    "dynamic_normal": { "start_tick": 4, "end_tick": 8 },
+    "dynamic_low_priority": { "start_tick": 8, "end_tick": 14 },
+    "fixed_normal": { "start_tick": 18, "end_tick": 22 },
+    "fixed_low_priority": { "start_tick": 22, "end_tick": 28 }
+  },
+  "expected": {
+    "work_units_per_arm": 100.0,
+    "dynamic_normal_joules": 12.0,
+    "dynamic_low_priority_joules": 10.8,
+    "fixed_normal_joules": 8.8,
+    "fixed_low_priority_joules": 9.6
+  },
+  "claim": "a longer low-priority run uses less energy only while it avoids the higher dynamic frequency state"
+}
