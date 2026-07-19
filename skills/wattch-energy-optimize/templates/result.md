@@ -16,8 +16,8 @@
 
 ## Results
 
-| condition | model | skill | trial/order | run id | correct | duration s | energy J | claim eligible | artifact |
-|---|---|---:|---|---|---:|---:|---:|---:|---|
+| condition | model | skill | trial/order | run id | correct | duration s | energy J | descriptive eligible | physical claim eligible | artifact |
+|---|---|---:|---|---|---:|---:|---:|---:|---:|---|
 
 ## Change and mechanism
 

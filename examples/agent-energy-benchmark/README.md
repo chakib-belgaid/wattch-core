@@ -106,3 +106,86 @@ hashes. CLI outcomes use the acknowledged pre-launch `TARGET_SPAWN` through
 `TARGET_EXIT` window so fast children cannot run ahead of the start marker. A
 single run never enables a comparison claim, and no local run measures Luna or
 Terra inference in the provider datacenter.
+
+## Physical generated-code follow-up on macOS
+
+The four frozen submissions can be compared on the local Apple CPU power domain.
+This measures the generated programs, not remote Luna or Terra inference. Build
+the current binaries first:
+
+```bash
+cargo build --release -p wattch-cli -p wattch-powerd
+```
+
+`powermetrics` requires root. In a separate terminal, start the daemon as root
+while explicitly retaining the local `staff` group for the socket. Supplying
+`-g staff` without `-u root` is insufficient.
+
+```bash
+sudo -u root -g staff /absolute/wattch-core/target/release/wattch-powerd \
+  --socket /absolute/results/wattch-powerd.sock \
+  --backend apple-powermetrics \
+  --powermetrics-interval-ms 250 \
+  --node-id agent-energy-mac \
+  --os-telemetry off \
+  --allow-uid "$(id -u)"
+```
+
+Freeze the exact four candidates, runtime, workload driver, output contract,
+warm-up order, qualification pilot, and counterbalanced matrix in a create-only
+plan. The runner binds macOS `sandbox-exec` and denies process creation inside
+the agent-generated candidate, preventing detached descendants from escaping
+the CLI process group and contaminating later trials:
+
+```bash
+python3 examples/agent-energy-benchmark/physical_study.py prepare \
+  --state /results/luna-control/state.json \
+          /results/luna-skill/state.json \
+          /results/terra-control/state.json \
+          /results/terra-skill/state.json \
+  --out /results/physical/physical-plan.json \
+  --plan-id agent-energy-physical-v1
+
+python3 examples/agent-energy-benchmark/physical_study.py verify \
+  --plan /results/physical/physical-plan.json
+
+python3 examples/agent-energy-benchmark/physical_study.py preflight \
+  --plan /results/physical/physical-plan.json \
+  --socket /results/wattch-powerd.sock
+```
+
+Preflight requires exactly one 250 ms Apple CPU interval-average source and its
+canonical native-duration companion. The full run additionally requires a
+host-specific `METER_CALIBRATION` covering IDLE, FIXED_LOAD, and A/A regimes.
+Run preflight and the study from a macOS terminal context where `sandbox-exec`
+is permitted; a containing application sandbox may reject the nested profile.
+The lower-level schema-v1 artifact described in `clients/python/README.md` is
+accepted only for an exploratory local-domain comparison; it cannot authorize a
+confirmatory physical claim.
+
+That calibration is an operator-provided prerequisite; this runner does not
+manufacture or infer it from treatment trials. Collect the regimes and strict
+thresholds with the offline calibration workflow in
+[`docs/energy-impact-study.md`](../../docs/energy-impact-study.md#meter-calibration),
+then use the artifact APIs in
+[`clients/python/README.md`](../../clients/python/README.md#system-impact-study-artifacts).
+If it has not been measured for the current host and source, stop at preflight;
+do not create a placeholder calibration JSON.
+
+```bash
+python3 examples/agent-energy-benchmark/physical_study.py run \
+  --plan /results/physical/physical-plan.json \
+  --socket /results/wattch-powerd.sock \
+  --calibration /results/physical/meter-calibration.json \
+  --wattch /absolute/wattch-core/target/release/wattch \
+  --out /results/physical/study-001
+```
+
+The runner executes balanced unmeasured warm-ups, waits for cooldown, then runs
+one measured qualification pilot. The 32-trial matrix starts only if the pilot
+passes exact-output, mutation-scope, lifecycle, source, native-sample, marker,
+gap, quality, and calibration gates. Each repeated call uses a distinct seed so
+the declared useful work cannot collapse into a cached result. `RESULTS.json`
+contains paired estimates and bootstrap intervals, while
+`physical_comparison_claim_eligible` and remote-model/whole-machine claim flags
+remain false for this exploratory path.

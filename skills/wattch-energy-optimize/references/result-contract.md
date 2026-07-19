@@ -23,7 +23,8 @@ backend
 sampling_mode
 evidence_class
 energy_joules_or_null
-claim_eligible
+descriptive_local_run_eligible
+physical_claim_eligible
 failure_or_warning
 ```
 
@@ -43,8 +44,8 @@ Allowed synthetic conclusion:
 
 > The MCP/CLI workflow produced valid replayable artifacts. The source was synthetic, so no physical energy ranking is reported.
 
-Allowed local-domain conclusion when calibrated evidence exists:
+Allowed exploratory local-domain conclusion when every schema-v1 gate passes:
 
-> For this host, source boundary, frozen workload, and repeated trial set, the candidate had a lower median source-domain energy outcome while preserving the declared output and useful work.
+> In this exploratory local-domain estimate for the frozen host, source, and workload, the candidate had a lower median source-domain outcome while preserving declared output and useful work. This is not a confirmatory physical-energy claim.
 
 Never say the result is the model's datacenter energy, total-machine energy, carbon footprint, or process-private consumption unless those boundaries were independently measured.

@@ -17,9 +17,21 @@ Choose exactly one primary source unless descriptors explicitly authorize a disj
 
 - Run shared-domain trials sequentially after background build/test activity is idle.
 - Freeze inputs, useful work, output digest, dependencies, and timeout.
+- Bind the candidate SHA-256 in the manifest and require matching, clean
+  before/after mutation scopes. Recheck coordinator, plan, analyzer, skill, and
+  Wattch hashes around every untrusted workload.
+- Run one source-qualification pilot before the comparison. Require the marker
+  window to cover at least ten native source updates; a shorter window or a
+  faster client poll interval is not a substitute for native observations.
+- Derive the marker duration and in-window sample count from decoded traces;
+  never trust a trial-authored duration. Canonical quality metadata uses
+  `sequence_gaps` and must equal the gaps derived from raw sample sequences.
 - Warm up separately, then alternate or counterbalance baseline/candidate order.
 - Keep failures in the outcome table. Report pass rate beside conditional energy results.
 - One run per condition is a smoke demonstration. Comparative claims need repeated blocks and uncertainty.
+- A lower-level schema-v1 meter calibration supports exploratory local-domain
+  estimates only. It does not authorize a confirmatory physical claim; that
+  requires replay-verified calibration and the repository's verified study path.
 - Do not call joules carbon, whole-machine energy, or datacenter energy without a separately validated boundary.
 
 ## Agent comparisons

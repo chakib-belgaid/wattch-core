@@ -762,6 +762,27 @@ def compare_states(paths: Iterable[Path]) -> dict[str, object]:
     failures: list[str] = []
     if condition_ids != set(CONDITIONS):
         failures.append("the four canonical conditions are not present exactly once")
+    trial_orders: list[object] = []
+    for state in states:
+        condition = state.get("condition")
+        condition_id = condition.get("id") if isinstance(condition, dict) else None
+        expected = CONDITIONS.get(condition_id)
+        if (
+            not isinstance(condition, dict)
+            or expected is None
+            or condition.get("model") != expected[0]
+            or condition.get("reasoning_effort") != EFFORT
+            or condition.get("skill_enabled") is not expected[1]
+        ):
+            failures.append(f"condition {condition_id!r} has non-canonical identity metadata")
+        trial_orders.append(
+            condition.get("trial_order") if isinstance(condition, dict) else None
+        )
+    if (
+        any(isinstance(order, bool) or not isinstance(order, int) for order in trial_orders)
+        or set(trial_orders) != {1, 2, 3, 4}
+    ):
+        failures.append("trial_order must be a permutation of 1 through 4")
     reference = states[0]
     for state in states[1:]:
         for field in ("base", "prompt", "candidate", "workload", "expected_output"):

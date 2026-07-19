@@ -15,9 +15,13 @@ Before editing, freeze:
 - repository revision and mutable files;
 - daemon socket, sampling interval, output root, and run-id pattern;
 - one primary source boundary and the requested repetitions;
+- exact candidate SHA-256 plus valid before/after mutation-scope records;
 - the baseline/candidate order or a recorded counterbalancing seed.
 
 Do not let the code under test choose the authoritative measurement window.
+Before launching a comparison matrix, capture one source-qualification pilot.
+Proceed only when the selected source, native cadence, marker coverage, and
+quality gates are usable for the frozen workload.
 
 ## Qualify the source
 
@@ -39,8 +43,10 @@ Read [references/measurement-integrity.md](references/measurement-integrity.md) 
 3. Make one narrow optimization whose mechanism you can explain.
 4. Run the same verifier before inspecting performance.
 5. Capture the candidate with the same command, input, source, and interval.
-6. Repeat sequentially and counterbalance order; do not overlap shared-domain trials.
-7. Preserve failed runs and raw artifacts instead of silently excluding them.
+6. Make each measured window span at least ten native source updates; faster
+   client polling does not create independent hardware samples.
+7. Repeat sequentially and counterbalance order; do not overlap shared-domain trials.
+8. Preserve failed runs and raw artifacts instead of silently excluding them.
 
 Use one of the exact workflows in [references/cli-mcp.md](references/cli-mcp.md). Always call `wattch_capture_stop` in a cleanup path after a successful start. Treat `wattch_inspect` as integrity evidence, not a joule calculator.
 
@@ -48,6 +54,6 @@ Use one of the exact workflows in [references/cli-mcp.md](references/cli-mcp.md)
 
 Correctness is a gate. If outputs or useful work differ, do not call the candidate an optimization.
 
-Prefer repeated single-source joules only when every explicit source, artifact, correctness, quality, calibration, and hash gate is claim-eligible. Eligibility fails closed when a gate is absent. Otherwise report duration, correctness, raw artifact paths, and plumbing status without inventing energy. Separate agent-workflow evidence from generated-code workload evidence.
+Prefer repeated single-source joules only when every explicit source, artifact, correctness, quality, calibration, trace, and hash gate is eligible. Schema-v1 calibration authorizes only an exploratory `descriptive_local_run_eligible` result; it never sets physical or confirmatory claim flags. Eligibility fails closed when a gate is absent. Otherwise report duration, correctness, raw artifact paths, and plumbing status without inventing energy. Separate agent-workflow evidence from generated-code workload evidence.
 
 Use [references/result-contract.md](references/result-contract.md) and [templates/result.md](templates/result.md). Include run IDs, source UID, boundary, backend, evidence class, marker window, repetitions, statistic, raw values, uncertainty, failures, and limitations.

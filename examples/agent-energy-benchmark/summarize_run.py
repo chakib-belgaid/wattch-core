@@ -143,6 +143,9 @@ def main() -> None:
     qualification["outcome_computable"] = True
     result = {
         "claim_eligible": qualification["physical_run_claim_eligible"],
+        "descriptive_local_run_eligible": qualification[
+            "descriptive_local_run_eligible"
+        ],
         "physical_comparison_claim_eligible": qualification[
             "physical_comparison_claim_eligible"
         ],

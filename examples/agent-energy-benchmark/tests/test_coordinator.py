@@ -213,6 +213,42 @@ class CoordinatorTest(unittest.TestCase):
             )
         )
 
+    def test_compare_states_rejects_relabelled_model_or_skill_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for order, (condition_id, (model, skill_enabled)) in enumerate(
+                coordinator.CONDITIONS.items(), start=1
+            ):
+                state = {
+                    "condition": {
+                        "id": condition_id,
+                        "model": model,
+                        "reasoning_effort": coordinator.EFFORT,
+                        "skill_enabled": skill_enabled,
+                        "trial_order": order,
+                    },
+                    "base": {"commit_sha": "commit", "tree_sha": "tree"},
+                    "prompt": {"sha256": "prompt"},
+                    "candidate": {"relative_path": "candidate.py"},
+                    "workload": {"events": 1},
+                    "expected_output": {"stdout_sha256": "output"},
+                }
+                path = root / f"{condition_id}.json"
+                path.write_text(json.dumps(state), "utf-8")
+                paths.append(path)
+
+            self.assertTrue(coordinator.compare_states(paths)["valid"])
+            relabelled = json.loads(paths[0].read_text("utf-8"))
+            relabelled["condition"]["model"] = "gpt-5.6-terra"
+            paths[0].write_text(json.dumps(relabelled), "utf-8")
+            rejected = coordinator.compare_states(paths)
+
+        self.assertFalse(rejected["valid"])
+        self.assertTrue(
+            any("non-canonical" in failure for failure in rejected["failures"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
