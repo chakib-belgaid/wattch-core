@@ -741,6 +741,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nix 0.29.0",
  "serde",
  "serde_json",
  "thiserror",
@@ -767,6 +768,22 @@ dependencies = [
  "tracing",
  "wattch-core",
  "wattch-protocol",
+]
+
+[[package]]
+name = "wattch-mcp"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "wattch-cli",
+ "wattch-core",
+ "wattch-daemon",
+ "wattch-protocol",
+ "wattch-testd",
 ]
 
 [[package]]

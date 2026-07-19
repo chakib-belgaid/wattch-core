@@ -37,6 +37,7 @@ wattch-powerd: linux-rapl, Apple powermetrics, and synthetic power backends,
 plus descriptor-preserving Linux OS-telemetry composition
 wattch-testd deterministic daemon for protocol validation and golden tests
 CLI capture/inspect/validate workflow with replayable trace artifacts
+local MCP stdio adapter for agent-owned raw capture windows
 pywattch Python client: updated pyJoules-compatible API
 matched C0/C1/C2 experiment scheduling, raw trial artifacts, boundary-aware
 offline energy outcomes, paired effects, and a control-only dynamic baseline
@@ -90,7 +91,10 @@ crates/wattch-testd
   deterministic daemon serving scenario files over the same protocol
 
 crates/wattch-cli
-  wattch sources / capture / inspect / validate against a live daemon
+  wattch sources / capture / run / inspect / validate against a live daemon
+
+crates/wattch-mcp
+  bounded MCP stdio tools for source discovery, stateful raw capture, and replay
 
 clients/python
   pywattch: protocol client, pyJoules-compatible meter API, handlers,
@@ -110,6 +114,7 @@ docs/protocol-v0.md     protocol rules, wire format, invariants
 docs/powerd.md          powermeter daemon install and privilege model
 docs/energy-impact-study.md  boundary-specific causal study and falsification plan
 docs/energy-tests.md    energy test conventions and semantics
+docs/mcp.md             local agent registration, tools, and safety boundary
 docs/architecture-start.md
 
 examples/scenarios      deterministic multi-source scenarios
@@ -123,7 +128,6 @@ examples/bench          benchmark specs used later by the benchmark layer
 NVML acquisition
 PowerAPI or HWPC Sensor adapters
 impact scoring
-MCP server
 HTML reports
 cluster coordinator
 per-process energy allocation
@@ -178,7 +182,39 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$(mktemp -d)}"
 ./target/debug/wattch sources
 ./target/debug/wattch capture --out runs --duration-ms 2000
 ./target/debug/wattch inspect --run runs/<run-id>
+
+# Shell-free command capture for automation and agents. Child output is kept in
+# the artifact, while --json emits one stable summary object.
+./target/debug/wattch run \
+  --out runs \
+  --run-id example-command-r01 \
+  --label model=example \
+  --json \
+  -- /usr/bin/true
 ```
+
+`wattch run` writes `command.json`, `target.stdout.log`, and
+`target.stderr.log` beside the ordinary manifest and raw/event traces. Its
+daemon-stamped `TARGET_SPAWN`, `TARGET_EXEC`, and `TARGET_EXIT` markers bracket
+the command with raw samples; interval-average sources retain a bounded native
+period tail. A nonzero command still produces a finished artifact and is
+returned as the CLI exit code. These are system/source measurements, not
+per-process energy allocation.
+
+Local coding-agent access uses the same unprivileged client/artifact boundary:
+
+```bash
+cargo build --release -p wattch-mcp
+codex mcp add wattch -- \
+  "$PWD/target/release/wattch-mcp" \
+  --workspace-root "$PWD" \
+  --runs-dir "$PWD/runs"
+```
+
+Use `--socket /absolute/path.sock` in the registered command when the daemon is
+not in a trusted auto-discovery path. See [docs/mcp.md](docs/mcp.md) for the
+tool contract. The MCP adapter returns raw descriptors and integrity summaries;
+it does not compute or compare energy.
 
 Real Linux acquisition composes RAPL with the raw OS signals that are readable
 on the host:

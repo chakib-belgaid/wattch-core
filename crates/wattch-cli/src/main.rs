@@ -1,9 +1,15 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use wattch_cli::artifact::{inspect_run, RunWriter, CLOCK_INSTANCE_ID_LABEL};
+use wattch_cli::artifact::{
+    inspect_run, CommandLifecycleStatus, RunWriter, CLOCK_INSTANCE_ID_LABEL,
+};
 use wattch_cli::client::{CaptureFrame, WattchClient};
+use wattch_cli::runner::{run_command, RunCommandOptions};
 use wattch_core::{validate_source_set, RunManifest, SourceDescriptor};
 use wattch_protocol::PROTOCOL_VERSION;
 
@@ -52,6 +58,36 @@ enum Command {
         run_id: Option<String>,
     },
 
+    /// Capture one shell-free command into a reproducible run artifact.
+    Run {
+        /// Unix socket to connect to. Same default resolution as `sources`.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+
+        /// Output root; the artifact is written to <out>/<run-id>/.
+        #[arg(long, default_value = "runs")]
+        out: PathBuf,
+
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
+
+        /// Explicit run id. Agent workflows should encode the trial condition.
+        #[arg(long)]
+        run_id: String,
+
+        /// Repeatable condition metadata, for example `--label model=terra`.
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<CliLabel>,
+
+        /// Emit exactly one machine-readable summary object on stdout.
+        #[arg(long)]
+        json: bool,
+
+        /// Program and arguments. `--` is required; no shell is inserted.
+        #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+        program: Vec<String>,
+    },
+
     /// Replay a run artifact offline and report per-source statistics.
     Inspect {
         #[arg(long)]
@@ -65,7 +101,7 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -160,6 +196,37 @@ fn main() -> Result<()> {
                 run_dir.display()
             );
         }
+        Command::Run {
+            socket,
+            out,
+            interval_ms,
+            run_id,
+            labels,
+            json,
+            program,
+        } => {
+            let socket = resolve_socket(socket)?;
+            let result = run_command(RunCommandOptions {
+                socket,
+                out,
+                interval_ms,
+                run_id,
+                labels: labels_to_map(labels)?,
+                argv: program,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!(
+                    "captured {} batches / {} samples into {} (command exit {})",
+                    result.batches,
+                    result.samples,
+                    result.run_dir.display(),
+                    result.exit_code
+                );
+            }
+            return Ok(ExitCode::from(result.wrapper_exit_code()));
+        }
         Command::Inspect { run } => {
             let report = inspect_run(&run)?;
             println!("run: {} (node {})", report.run_id, report.node_id);
@@ -167,6 +234,21 @@ fn main() -> Result<()> {
                 "batches: {}  samples: {}  event_batches: {}  events: {}",
                 report.batches, report.samples, report.event_batches, report.events
             );
+            if let Some(lifecycle) = &report.command_lifecycle {
+                match lifecycle.status {
+                    CommandLifecycleStatus::Complete => println!(
+                        "command: COMPLETE  exit_code: {}  signal: {}",
+                        lifecycle.exit_code.unwrap_or(1),
+                        lifecycle
+                            .signal
+                            .map_or_else(|| "none".to_string(), |signal| signal.to_string())
+                    ),
+                    CommandLifecycleStatus::Incomplete => println!(
+                        "WARNING: command lifecycle INCOMPLETE: {}",
+                        lifecycle.reason.as_deref().unwrap_or("unspecified reason")
+                    ),
+                }
+            }
             if report.unknown_source_samples > 0 {
                 println!(
                     "WARNING: {} samples reference unknown source ids",
@@ -207,7 +289,46 @@ fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliLabel {
+    key: String,
+    value: String,
+}
+
+impl FromStr for CliLabel {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let (key, value) = raw
+            .split_once('=')
+            .ok_or_else(|| "label must use KEY=VALUE".to_string())?;
+        if key.is_empty() {
+            return Err("label key must not be empty".to_string());
+        }
+        Ok(Self {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+    }
+}
+
+fn labels_to_map(labels: Vec<CliLabel>) -> Result<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    for label in labels {
+        if matches!(
+            label.key.as_str(),
+            CLOCK_INSTANCE_ID_LABEL | "pid" | "returncode" | "signal"
+        ) {
+            bail!("--label key {:?} is reserved", label.key);
+        }
+        if parsed.insert(label.key.clone(), label.value).is_some() {
+            bail!("duplicate --label key {:?}", label.key);
+        }
+    }
+    Ok(parsed)
 }
 
 /// Resolve the daemon socket to connect to. An explicit `--socket` always
@@ -295,5 +416,56 @@ mod tests {
         // no behavior change vs. before this feature existed.
         let explicit = unique_temp_path("explicit-missing");
         assert_eq!(resolve_socket(Some(explicit.clone())).unwrap(), explicit);
+    }
+
+    #[test]
+    fn run_parser_preserves_trailing_program_arguments() {
+        let cli = Cli::try_parse_from([
+            "wattch",
+            "run",
+            "--run-id",
+            "agent-r01",
+            "--label",
+            "note=a=b",
+            "--json",
+            "--",
+            "tool",
+            "--json",
+            "literal;argument",
+        ])
+        .unwrap();
+        let Command::Run {
+            run_id,
+            labels,
+            json,
+            program,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(run_id, "agent-r01");
+        assert_eq!(labels, vec!["note=a=b".parse().unwrap()]);
+        assert!(json);
+        assert_eq!(program, ["tool", "--json", "literal;argument"]);
+    }
+
+    #[test]
+    fn run_labels_reject_malformed_duplicate_and_reserved_keys() {
+        assert!("missing-separator".parse::<CliLabel>().is_err());
+        assert!("=value".parse::<CliLabel>().is_err());
+
+        let duplicate = vec![
+            "model=luna".parse().unwrap(),
+            "model=terra".parse().unwrap(),
+        ];
+        assert!(labels_to_map(duplicate).is_err());
+        assert!(labels_to_map(vec!["pid=12".parse().unwrap()]).is_err());
+        assert!(
+            labels_to_map(vec![format!("{CLOCK_INSTANCE_ID_LABEL}=clock")
+                .parse()
+                .unwrap()])
+            .is_err()
+        );
     }
 }

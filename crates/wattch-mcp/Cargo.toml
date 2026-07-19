@@ -1,0 +1,27 @@
+[package]
+name = "wattch-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Local MCP stdio adapter for Wattch acquisition and trace artifacts"
+
+[[bin]]
+name = "wattch-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wattch-cli = { path = "../wattch-cli" }
+wattch-core.workspace = true
+wattch-protocol.workspace = true
+
+[dev-dependencies]
+wattch-daemon.workspace = true
+wattch-testd = { path = "../wattch-testd" }

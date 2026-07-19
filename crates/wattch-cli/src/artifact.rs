@@ -6,13 +6,15 @@
 //!   sources.json      SourceDescriptor list (also embedded in the manifest)
 //!   raw.trace.wch     framed binary RawSampleBatch messages, replayable
 //!   events.trace.wch  framed binary EventBatch messages, replayable
+//!   command.json      optional shell-free command declaration
+//!   command.lifecycle.jsonl  optional append-only command completion ledger
 //!   trial.json        optional experiment-runner metadata
 //!   quality.json      optional offline evidence-quality metadata
 //!   checksums.json    optional artifact-integrity metadata
 //! ```
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -31,6 +33,9 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SOURCES_FILE: &str = "sources.json";
 pub const RAW_TRACE_FILE: &str = "raw.trace.wch";
 pub const EVENTS_TRACE_FILE: &str = "events.trace.wch";
+pub const COMMAND_FILE: &str = "command.json";
+pub const COMMAND_LIFECYCLE_FILE: &str = "command.lifecycle.jsonl";
+pub const COMMAND_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 pub const TRIAL_FILE: &str = "trial.json";
 pub const QUALITY_FILE: &str = "quality.json";
 pub const CHECKSUMS_FILE: &str = "checksums.json";
@@ -47,14 +52,94 @@ const MAX_LEGACY_TRACE_PAYLOAD_LEN: u32 = MAX_PAYLOAD_LEN * 16;
 /// provides safe, create-only JSON I/O without interpreting their contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JsonSidecar {
+    Command,
     Trial,
     Quality,
     Checksums,
 }
 
+/// One append-only record in `command.lifecycle.jsonl`.
+///
+/// The runner writes `STARTED` before executing the command and exactly one
+/// terminal record. A missing or malformed terminal record is never treated
+/// as a complete command capture.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum CommandLifecycleRecord {
+    Started {
+        schema_version: u32,
+        run_id: String,
+    },
+    Complete {
+        schema_version: u32,
+        run_id: String,
+        exit_code: i32,
+        signal: Option<i32>,
+        batches: u64,
+        samples: u64,
+    },
+    Incomplete {
+        schema_version: u32,
+        run_id: String,
+        reason: String,
+    },
+}
+
+impl CommandLifecycleRecord {
+    pub(crate) fn started(run_id: &str) -> Self {
+        Self::Started {
+            schema_version: COMMAND_LIFECYCLE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+        }
+    }
+
+    pub(crate) fn complete(
+        run_id: &str,
+        exit_code: i32,
+        signal: Option<i32>,
+        batches: u64,
+        samples: u64,
+    ) -> Self {
+        Self::Complete {
+            schema_version: COMMAND_LIFECYCLE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            exit_code,
+            signal,
+            batches,
+            samples,
+        }
+    }
+
+    pub(crate) fn incomplete(run_id: &str, reason: String) -> Self {
+        Self::Incomplete {
+            schema_version: COMMAND_LIFECYCLE_SCHEMA_VERSION,
+            run_id: run_id.to_string(),
+            reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandLifecycleStatus {
+    Complete,
+    Incomplete,
+}
+
+/// Inspection result for a command-backed artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandLifecycleSummary {
+    pub status: CommandLifecycleStatus,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub batches: Option<u64>,
+    pub samples: Option<u64>,
+    pub reason: Option<String>,
+}
+
 impl JsonSidecar {
     pub const fn file_name(self) -> &'static str {
         match self {
+            Self::Command => COMMAND_FILE,
             Self::Trial => TRIAL_FILE,
             Self::Quality => QUALITY_FILE,
             Self::Checksums => CHECKSUMS_FILE,
@@ -590,6 +675,7 @@ pub struct InspectReport {
     pub unknown_source_samples: u64,
     pub per_source: BTreeMap<u32, SourceStats>,
     pub per_event_kind: BTreeMap<String, u64>,
+    pub command_lifecycle: Option<CommandLifecycleSummary>,
 }
 
 /// Replay a run artifact and compute per-source statistics and integrity
@@ -642,5 +728,143 @@ pub fn inspect_run(run_dir: &Path) -> Result<InspectReport, ArtifactError> {
     )?;
     report.event_batches = event_batches;
     report.events = event_validator.events_seen();
+    report.command_lifecycle = inspect_command_lifecycle(run_dir, &manifest.run_id, &report)?;
     Ok(report)
+}
+
+fn inspect_command_lifecycle(
+    run_dir: &Path,
+    run_id: &str,
+    report: &InspectReport,
+) -> Result<Option<CommandLifecycleSummary>, ArtifactError> {
+    let command_path = run_dir.join(COMMAND_FILE);
+    let lifecycle_path = run_dir.join(COMMAND_LIFECYCLE_FILE);
+    let command_exists = command_path.try_exists().map_err(io_err(&command_path))?;
+    let lifecycle_exists = lifecycle_path
+        .try_exists()
+        .map_err(io_err(&lifecycle_path))?;
+    if !command_exists && !lifecycle_exists {
+        return Ok(None);
+    }
+    if !lifecycle_exists {
+        return Ok(Some(incomplete_lifecycle(
+            "command lifecycle ledger is missing",
+        )));
+    }
+
+    let raw = read_bounded_metadata(&lifecycle_path)?;
+    let mut records = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        records.push(
+            serde_json::from_str::<CommandLifecycleRecord>(line).map_err(|source| {
+                ArtifactError::Json {
+                    path: lifecycle_path.clone(),
+                    source,
+                }
+            })?,
+        );
+    }
+    if records.is_empty() {
+        return Ok(Some(incomplete_lifecycle(
+            "command lifecycle ledger has no STARTED record",
+        )));
+    }
+    if records.len() > 2 {
+        return Err(ArtifactError::MetadataMismatch(
+            "command lifecycle ledger contains records after its terminal state".to_string(),
+        ));
+    }
+
+    match &records[0] {
+        CommandLifecycleRecord::Started {
+            schema_version,
+            run_id: record_run_id,
+        } => validate_lifecycle_identity(*schema_version, record_run_id, run_id)?,
+        _ => {
+            return Err(ArtifactError::MetadataMismatch(
+                "command lifecycle ledger must begin with STARTED".to_string(),
+            ))
+        }
+    }
+    let Some(terminal) = records.get(1) else {
+        return Ok(Some(incomplete_lifecycle(
+            "command lifecycle terminal record is missing",
+        )));
+    };
+
+    match terminal {
+        CommandLifecycleRecord::Complete {
+            schema_version,
+            run_id: record_run_id,
+            exit_code,
+            signal,
+            batches,
+            samples,
+        } => {
+            validate_lifecycle_identity(*schema_version, record_run_id, run_id)?;
+            if !command_exists {
+                return Err(ArtifactError::MetadataMismatch(
+                    "COMPLETE command lifecycle has no command.json declaration".to_string(),
+                ));
+            }
+            if *batches != report.batches || *samples != report.samples {
+                return Err(ArtifactError::MetadataMismatch(format!(
+                    "COMPLETE command lifecycle counts {batches}/{samples} do not match replayed {}/{}",
+                    report.batches, report.samples
+                )));
+            }
+            Ok(Some(CommandLifecycleSummary {
+                status: CommandLifecycleStatus::Complete,
+                exit_code: Some(*exit_code),
+                signal: *signal,
+                batches: Some(*batches),
+                samples: Some(*samples),
+                reason: None,
+            }))
+        }
+        CommandLifecycleRecord::Incomplete {
+            schema_version,
+            run_id: record_run_id,
+            reason,
+        } => {
+            validate_lifecycle_identity(*schema_version, record_run_id, run_id)?;
+            Ok(Some(incomplete_lifecycle(reason)))
+        }
+        CommandLifecycleRecord::Started { .. } => Err(ArtifactError::MetadataMismatch(
+            "command lifecycle ledger contains STARTED where a terminal record is required"
+                .to_string(),
+        )),
+    }
+}
+
+fn validate_lifecycle_identity(
+    schema_version: u32,
+    record_run_id: &str,
+    expected_run_id: &str,
+) -> Result<(), ArtifactError> {
+    if schema_version != COMMAND_LIFECYCLE_SCHEMA_VERSION {
+        return Err(ArtifactError::MetadataMismatch(format!(
+            "unsupported command lifecycle schema version {schema_version}"
+        )));
+    }
+    if record_run_id != expected_run_id {
+        return Err(ArtifactError::MetadataMismatch(format!(
+            "command lifecycle run_id {record_run_id:?} does not match {expected_run_id:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn incomplete_lifecycle(reason: impl Into<String>) -> CommandLifecycleSummary {
+    CommandLifecycleSummary {
+        status: CommandLifecycleStatus::Incomplete,
+        exit_code: None,
+        signal: None,
+        batches: None,
+        samples: None,
+        reason: Some(reason.into()),
+    }
 }

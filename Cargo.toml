@@ -6,6 +6,7 @@ members = [
   "crates/wattch-testd",
   "crates/wattch-powerd",
   "crates/wattch-cli",
+  "crates/wattch-mcp",
 ]
 resolver = "2"
 

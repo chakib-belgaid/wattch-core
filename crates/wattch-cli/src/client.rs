@@ -26,6 +26,11 @@ pub enum ClientError {
     #[error(transparent)]
     Wire(#[from] WireError),
 
+    #[error(
+        "socket read timed out after consuming {bytes_read} bytes of a frame; connection closed to prevent decoder desynchronization"
+    )]
+    PartialFrameTimeout { bytes_read: usize },
+
     #[error("socket configuration failed: {0}")]
     Io(#[from] std::io::Error),
 
@@ -43,6 +48,7 @@ pub enum ClientError {
 }
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const CAPTURE_BATCH_SLACK: u64 = 64;
 const MAX_CAPTURE_BATCH_BYTES: usize = 1024 * 1024;
@@ -605,12 +611,16 @@ fn client_timeout(error: &ClientError) -> bool {
 
 struct DeadlineReader<'a> {
     stream: &'a mut UnixStream,
-    deadline: Instant,
+    idle_deadline: Instant,
+    frame_deadline: Option<Instant>,
+    frame_completion_timeout: Duration,
+    bytes_read: usize,
 }
 
 impl Read for DeadlineReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+        let deadline = self.frame_deadline.unwrap_or(self.idle_deadline);
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "read deadline exceeded",
@@ -618,15 +628,51 @@ impl Read for DeadlineReader<'_> {
         };
         self.stream
             .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
-        self.stream.read(buffer)
+        let count = self.stream.read(buffer)?;
+        if count > 0 && self.bytes_read == 0 {
+            self.frame_deadline = Some(
+                Instant::now()
+                    .checked_add(self.frame_completion_timeout)
+                    .ok_or_else(|| io::Error::other("frame completion deadline is too large"))?,
+            );
+        }
+        self.bytes_read = self.bytes_read.saturating_add(count);
+        Ok(count)
     }
 }
 
-fn read_message_before(stream: &mut UnixStream, timeout: Duration) -> Result<Message, WireError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| WireError::Io(io::Error::other("read deadline is too large")))?;
-    read_message(&mut DeadlineReader { stream, deadline })
+fn read_message_before(stream: &mut UnixStream, timeout: Duration) -> Result<Message, ClientError> {
+    read_message_before_with_frame_timeout(stream, timeout, FRAME_COMPLETION_TIMEOUT)
+}
+
+fn read_message_before_with_frame_timeout(
+    stream: &mut UnixStream,
+    idle_timeout: Duration,
+    frame_completion_timeout: Duration,
+) -> Result<Message, ClientError> {
+    let idle_deadline = Instant::now()
+        .checked_add(idle_timeout)
+        .ok_or_else(|| ClientError::Protocol("read deadline is too large".to_string()))?;
+    let (result, bytes_read) = {
+        let mut reader = DeadlineReader {
+            stream,
+            idle_deadline,
+            frame_deadline: None,
+            frame_completion_timeout,
+            bytes_read: 0,
+        };
+        let result = read_message(&mut reader);
+        (result, reader.bytes_read)
+    };
+
+    match result {
+        Err(error) if wire_timeout(&error) && bytes_read > 0 => {
+            let _ = stream.shutdown(Shutdown::Both);
+            Err(ClientError::PartialFrameTimeout { bytes_read })
+        }
+        Ok(message) => Ok(message),
+        Err(error) => Err(ClientError::Wire(error)),
+    }
 }
 
 fn compatible_version(daemon_version: &str) -> bool {
@@ -638,8 +684,28 @@ fn compatible_version(daemon_version: &str) -> bool {
 
 #[cfg(test)]
 mod version_tests {
-    use super::compatible_version;
+    use super::{
+        client_timeout, compatible_version, read_message_before,
+        read_message_before_with_frame_timeout, ClientError,
+    };
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+    use std::time::Duration;
+    use wattch_protocol::frame::FRAME_HEADER_LEN;
+    use wattch_protocol::messages::{write_message, HelloRequest, Message};
     use wattch_protocol::PROTOCOL_VERSION;
+
+    fn encoded_message() -> (Message, Vec<u8>) {
+        let message = Message::HelloRequest(HelloRequest {
+            client_name: "fragment-test".to_string(),
+            client_version: "1.2.3".to_string(),
+            protocol_version: PROTOCOL_VERSION.to_string(),
+        });
+        let mut encoded = Vec::new();
+        write_message(&mut encoded, &message).unwrap();
+        (message, encoded)
+    }
 
     #[test]
     fn live_protocol_accepts_same_major_minor_patch_versions() {
@@ -654,5 +720,75 @@ mod version_tests {
         assert!(!compatible_version("1.2.0"));
         assert!(!compatible_version(""));
         assert!(!compatible_version("garbage"));
+    }
+
+    #[test]
+    fn deadline_reader_accepts_fragmented_header_and_payload_within_one_deadline() {
+        let (expected, encoded) = encoded_message();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let first_payload_end = (FRAME_HEADER_LEN + 3).min(encoded.len());
+        let chunks = [
+            encoded[..3].to_vec(),
+            encoded[3..first_payload_end].to_vec(),
+            encoded[first_payload_end..].to_vec(),
+        ];
+        let sender = thread::spawn(move || {
+            for chunk in chunks {
+                writer.write_all(&chunk).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let decoded = read_message_before(&mut reader, Duration::from_millis(250)).unwrap();
+        sender.join().unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn timeout_after_partial_header_is_non_retryable() {
+        let (_, encoded) = encoded_message();
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            writer.write_all(&encoded[..3]).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let error = read_message_before_with_frame_timeout(
+            &mut reader,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::PartialFrameTimeout { bytes_read: 3 }
+        ));
+        assert!(!client_timeout(&error));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn timeout_after_partial_payload_is_non_retryable() {
+        let (_, encoded) = encoded_message();
+        let sent = FRAME_HEADER_LEN + 2;
+        assert!(encoded.len() > sent);
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            writer.write_all(&encoded[..sent]).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let error = read_message_before_with_frame_timeout(
+            &mut reader,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::PartialFrameTimeout { bytes_read } if bytes_read == sent
+        ));
+        assert!(!client_timeout(&error));
+        sender.join().unwrap();
     }
 }
