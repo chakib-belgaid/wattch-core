@@ -66,6 +66,23 @@ class CandidateContractTest(unittest.TestCase):
             json.dumps(parsed, sort_keys=True, separators=(",", ":")) + "\n",
         )
 
+    def test_run_preserves_nonpositive_repeat_behavior(self) -> None:
+        empty_digest = (
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+        for repeat in (0, -2):
+            self.assertEqual(
+                candidate.run(73, 9, 17, repeat),
+                {
+                    "accounts": 0,
+                    "events": 73,
+                    "repeat": repeat,
+                    "result_sha256": empty_digest,
+                    "schema_version": 1,
+                    "seed": 17,
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

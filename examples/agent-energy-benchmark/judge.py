@@ -81,7 +81,7 @@ def reference_events(count: int, accounts: int, seed: int) -> list[tuple[int, in
 
 def expected_output(count: int, accounts: int, seed: int, repeat: int) -> dict[str, object]:
     events = reference_events(count, accounts, seed)
-    summary = reference_summary(events)
+    summary = reference_summary(events) if repeat > 0 else []
     encoded = json.dumps(
         summary,
         sort_keys=True,
@@ -247,10 +247,12 @@ def probe_candidate(path: Path, python: Path) -> dict[str, object]:
         failures.append("canonical_bytes mismatch")
 
     cli_cases = ((73, 9, 17, 2), (1021, 61, -91, 3))
-    for count, accounts, seed, repeat in cli_cases:
+    run_cases = (*cli_cases, (73, 9, 17, 0), (73, 9, 17, -2))
+    for count, accounts, seed, repeat in run_cases:
         expected = expected_output(count, accounts, seed, repeat)
         if module.run(count, accounts, seed, repeat) != expected:
             failures.append(f"run mismatch for {(count, accounts, seed, repeat)!r}")
+    for count, accounts, seed, repeat in cli_cases:
         argv = candidate_argv(python, path, count, accounts, seed, repeat)
         completed = subprocess.run(argv, capture_output=True, check=False)
         if completed.returncode != 0:

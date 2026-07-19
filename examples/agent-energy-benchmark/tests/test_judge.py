@@ -114,6 +114,15 @@ class ArtifactJudgeTest(unittest.TestCase):
         result = judge.probe_candidate(ROOT / "candidate.py", Path(sys.executable))
         self.assertTrue(result["correct"], result)
 
+    def test_reference_preserves_nonpositive_repeat_behavior(self) -> None:
+        for repeat in (0, -2):
+            result = judge.expected_output(73, 9, 17, repeat)
+            self.assertEqual(result["accounts"], 0)
+            self.assertEqual(
+                result["result_sha256"],
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
