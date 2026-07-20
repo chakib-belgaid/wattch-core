@@ -81,6 +81,12 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         pre_spawn_delay_us: u64,
 
+        /// Continue draining telemetry after TARGET_EXIT without extending the
+        /// workload measurement window. Useful for interval reconstruction on
+        /// short commands.
+        #[arg(long, default_value_t = 0)]
+        post_exit_capture_ms: u64,
+
         /// Bound target wall time. On expiry Wattch terminates the target's
         /// dedicated process group, then finalizes the capture artifact.
         #[arg(long)]
@@ -236,6 +242,7 @@ fn main() -> Result<ExitCode> {
             out,
             interval_ms,
             pre_spawn_delay_us,
+            post_exit_capture_ms,
             timeout_ms,
             run_id,
             labels,
@@ -248,6 +255,7 @@ fn main() -> Result<ExitCode> {
                 out,
                 interval_ms,
                 pre_spawn_delay: Duration::from_micros(pre_spawn_delay_us),
+                post_exit_capture: Duration::from_millis(post_exit_capture_ms),
                 timeout: timeout_ms.map(Duration::from_millis),
                 run_id,
                 labels: labels_to_map(labels)?,

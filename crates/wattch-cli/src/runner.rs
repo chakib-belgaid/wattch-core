@@ -38,6 +38,7 @@ const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_KILL_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_POLL: Duration = Duration::from_millis(10);
 const MAX_PRE_SPAWN_DELAY: Duration = Duration::from_secs(60);
+const MAX_POST_EXIT_CAPTURE: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub struct RunCommandOptions {
@@ -45,6 +46,7 @@ pub struct RunCommandOptions {
     pub out: PathBuf,
     pub interval_ms: u64,
     pub pre_spawn_delay: Duration,
+    pub post_exit_capture: Duration,
     pub timeout: Option<Duration>,
     pub run_id: String,
     pub labels: BTreeMap<String, String>,
@@ -85,6 +87,7 @@ struct CommandMetadata<'a> {
     process_group: &'static str,
     timeout_ms: Option<u128>,
     pre_spawn_delay_us: u128,
+    post_exit_capture_ms: u128,
     labels: &'a BTreeMap<String, String>,
 }
 
@@ -153,6 +156,7 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
         process_group: "dedicated",
         timeout_ms: options.timeout.map(|timeout| timeout.as_millis()),
         pre_spawn_delay_us: options.pre_spawn_delay.as_micros(),
+        post_exit_capture_ms: options.post_exit_capture.as_millis(),
         labels: &options.labels,
     };
     write_json_sidecar(writer.run_dir(), JsonSidecar::Command, &command_metadata)?;
@@ -273,6 +277,7 @@ pub fn run_command(options: RunCommandOptions) -> Result<RunCommandResult> {
         run_id: &options.run_id,
         labels: &options.labels,
         timeout: options.timeout,
+        post_exit_capture: options.post_exit_capture,
     };
     let capture_result = capture_child(
         &mut session,
@@ -351,6 +356,9 @@ fn validate_options(options: &RunCommandOptions) -> Result<()> {
     if options.pre_spawn_delay > MAX_PRE_SPAWN_DELAY {
         bail!("--pre-spawn-delay-us must not exceed 60000000");
     }
+    if options.post_exit_capture > MAX_POST_EXIT_CAPTURE {
+        bail!("--post-exit-capture-ms must not exceed 60000");
+    }
 
     // Validate every augmented marker before creating files or connecting.
     for event in [
@@ -393,6 +401,7 @@ struct TargetContext<'a> {
     run_id: &'a str,
     labels: &'a BTreeMap<String, String>,
     timeout: Option<Duration>,
+    post_exit_capture: Duration,
 }
 
 fn capture_child(
@@ -416,6 +425,7 @@ fn capture_child(
 
     let mut status = None;
     let mut exit_event_ns = None;
+    let mut post_exit_deadline = None;
     let mut tail_deadline = None;
     let mut tail_error = None;
     let mut stop_deadline = None;
@@ -471,9 +481,14 @@ fn capture_child(
 
         if stop_deadline.is_none() {
             if let Some(exit_ns) = exit_event_ns {
-                if tail_tracker.ready(exit_ns) {
+                let tail_ready = tail_tracker.ready(exit_ns);
+                let post_exit_ready =
+                    post_exit_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+                if tail_ready && post_exit_ready {
                     session.stop().context("failed to stop command capture")?;
                     stop_deadline = Some(stop_deadline_from_now()?);
+                } else if tail_ready {
+                    tail_deadline = None;
                 } else if tail_deadline.is_none() {
                     tail_deadline = Some(
                         Instant::now()
@@ -501,6 +516,11 @@ fn capture_child(
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1))
                 .min(CAPTURE_POLL)
+        } else if let Some(deadline) = post_exit_deadline {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+                .min(CAPTURE_POLL)
         } else {
             CAPTURE_POLL
         };
@@ -510,6 +530,13 @@ fn capture_child(
                     CaptureFrame::RawSampleBatch(batch) => tail_tracker.observe(batch),
                     CaptureFrame::RecordEventAck(ack) if ack.event.event_id == "target-exit" => {
                         exit_event_ns = Some(ack.event.monotonic_ns);
+                        post_exit_deadline = Some(
+                            Instant::now()
+                                .checked_add(target.post_exit_capture)
+                                .ok_or_else(|| {
+                                    anyhow!("post-exit capture duration is too large")
+                                })?,
+                        );
                     }
                     _ => {}
                 }

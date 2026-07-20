@@ -765,6 +765,60 @@ fn interval_average_capture_waits_for_a_fresh_post_exit_tail() {
 }
 
 #[test]
+fn post_exit_capture_extends_trace_without_moving_target_exit() {
+    let (_server, socket) = start_server("post-exit-capture", BackendShape::IntervalAverage);
+    let out = output_root("post-exit-capture-out");
+    let output = Command::new(env!("CARGO_BIN_EXE_wattch"))
+        .arg("run")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--out")
+        .arg(&out)
+        .arg("--interval-ms")
+        .arg("10")
+        .arg("--post-exit-capture-ms")
+        .arg("80")
+        .arg("--run-id")
+        .arg("run-post-exit-capture")
+        .arg("--json")
+        .arg("--")
+        .args(["/bin/sh", "-c", "exit 0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let result = summary(&output);
+    let run_dir = PathBuf::from(result["run_dir"].as_str().unwrap());
+    let target_exit_ns = replayed_events(&run_dir)
+        .into_iter()
+        .find(|event| event.kind == "TARGET_EXIT")
+        .unwrap()
+        .monotonic_ns;
+    let mut power_timestamps = Vec::new();
+    replay_trace(&run_dir, |batch| {
+        power_timestamps.extend(
+            batch
+                .samples
+                .into_iter()
+                .filter(|sample| sample.source_id == 1)
+                .map(|sample| sample.monotonic_ns),
+        );
+    })
+    .unwrap();
+    assert!(
+        power_timestamps
+            .last()
+            .is_some_and(|timestamp| *timestamp >= target_exit_ns + 50_000_000),
+        "exit={target_exit_ns}, samples={power_timestamps:?}"
+    );
+    let command: Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("command.json")).unwrap())
+            .unwrap();
+    assert_eq!(command["post_exit_capture_ms"], 80);
+
+    let _ = std::fs::remove_dir_all(out);
+}
+
+#[test]
 fn sparse_periodic_pre_roll_covers_every_source_before_spawn() {
     let (_server, socket) = start_server("sparse-pre-roll", BackendShape::SparsePeriodic);
     let out = output_root("sparse-pre-roll-out");

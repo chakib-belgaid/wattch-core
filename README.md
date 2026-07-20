@@ -206,6 +206,11 @@ period tail. A nonzero command still produces a finished artifact and is
 returned as the CLI exit code. These are system/source measurements, not
 per-process energy allocation.
 
+For preregistered native-interval reconstruction, `wattch run` also accepts
+`--post-exit-capture-ms <0..60000>`. This retains raw telemetry after
+`TARGET_EXIT` without moving the workload marker or including the tail in the
+target outcome. The chosen duration is recorded in `command.json`.
+
 Local coding-agent access uses the same unprivileged client/artifact boundary:
 
 ```bash
