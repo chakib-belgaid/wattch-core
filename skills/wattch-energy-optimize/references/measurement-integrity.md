@@ -32,6 +32,12 @@ Choose exactly one primary source unless descriptors explicitly authorize a disj
 - A lower-level schema-v1 meter calibration supports exploratory local-domain
   estimates only. It does not authorize a confirmatory physical claim; that
   requires replay-verified calibration and the repository's verified study path.
+- A failed absolute phase-sensitivity gate must remain failed. A separately
+  sealed A/A floor may support an exploratory paired-difference estimand only
+  when its complete, balanced matrix clears both the frozen uncertainty floor
+  and a zero-excluding paired interval. The collector remains inside that
+  instrumented-system boundary; do not reinterpret the result as absolute or
+  process-private energy.
 - Do not call joules carbon, whole-machine energy, or datacenter energy without a separately validated boundary.
 
 ## Agent comparisons

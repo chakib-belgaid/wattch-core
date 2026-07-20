@@ -43,6 +43,7 @@ wattch run \
   --out runs/energy-opt \
   --run-id candidate-r01 \
   --interval-ms 100 \
+  --post-exit-capture-ms 0 \
   --timeout-ms 120000 \
   --label treatment=candidate \
   --label candidate_sha256=<exact-candidate-sha256> \
@@ -53,6 +54,13 @@ wattch run \
 ```
 
 No shell is inserted. Child stdout and stderr are stored as `target.stdout.log` and `target.stderr.log`; command provenance is stored in `command.json`. `TARGET_SPAWN`, `TARGET_EXEC`, and `TARGET_EXIT` delimit the command. `--timeout-ms` terminates the target process group but still finalizes the evidence. A nonzero child exit still leaves a `COMPLETE`, inspectable artifact and is passed through by the wrapper; finalization and correctness are separate gates.
+
+For an interval-average source that needs later native-interval reconstruction,
+you may preregister a nonzero `--post-exit-capture-ms` value, up to 60000. The
+CLI continues draining raw telemetry after `TARGET_EXIT`, records the duration
+in `command.json`, and leaves the measured marker window unchanged. Freeze the
+same value across comparison arms; never integrate the post-exit tail as target
+work or add it after observing a failed run.
 
 Validate structure:
 

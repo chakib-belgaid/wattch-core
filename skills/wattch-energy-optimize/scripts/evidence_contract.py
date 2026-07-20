@@ -89,6 +89,9 @@ INTERVAL_TIMELINE_RECONSTRUCTION_LABEL = (
 INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1 = (
     "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1"
 )
+INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2 = (
+    "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+)
 SYNTHETIC_BACKENDS = {"synthetic", "testd", "wattch-testd", "deterministic"}
 LOCAL_RAW_CLASSES = {"RAW_HARDWARE_COUNTER", "RAW_SENSOR_READING"}
 CORE_ARTIFACT_FILES = {
@@ -103,6 +106,8 @@ CLI_BOUND_FILES = CORE_ARTIFACT_FILES | {
     "target.stdout.log",
     "target.stderr.log",
 }
+PAIRED_DIFFERENTIAL_MODE = "PAIRED_DIFFERENTIAL"
+DIFFERENTIAL_READINESS_KIND = "wattch-agent-differential-readiness-diagnostic"
 
 
 def _nonnegative_int(value: object) -> bool:
@@ -468,7 +473,11 @@ def _interval_duration_source(
     reconstruction = labels.get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
     if (
         reconstruction is not None
-        and reconstruction != INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1
+        and reconstruction
+        not in {
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2,
+        }
     ):
         return None
     matches = [item for item in sources if item.get("source_uid") == duration_uid]
@@ -679,6 +688,8 @@ def _quality_gate(
     trial: dict[str, Any] | None,
     trace_evidence: dict[str, Any],
     sources: list[dict[str, Any]],
+    *,
+    allow_unevaluated_overhead: bool = False,
 ) -> tuple[bool, list[str]]:
     path = run / "quality.json"
     if not path.is_file():
@@ -688,9 +699,25 @@ def _quality_gate(
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False, ["QUALITY_NOT_ACCEPTED"]
     blockers: list[str] = []
-    if not isinstance(quality, dict) or quality.get("disposition") != "ACCEPTED":
-        blockers.append("QUALITY_NOT_ACCEPTED")
+    disposition = quality.get("disposition") if isinstance(quality, dict) else None
     issues = quality.get("issues") if isinstance(quality, dict) else None
+    overhead_review_only = (
+        allow_unevaluated_overhead
+        and disposition == "REVIEW_REQUIRED"
+        and isinstance(issues, list)
+        and bool(issues)
+        and all(
+            isinstance(issue, dict)
+            and issue.get("severity") == "WARNING"
+            and issue.get("code") == "OVERHEAD_NOT_EVALUATED"
+            for issue in issues
+        )
+        and quality.get("measurement_overhead_ratio") is None
+    )
+    if not isinstance(quality, dict) or (
+        disposition != "ACCEPTED" and not overhead_review_only
+    ):
+        blockers.append("QUALITY_NOT_ACCEPTED")
     if not isinstance(issues, list) or any(
         isinstance(issue, dict) and _upper(issue.get("severity")) == "ERROR"
         for issue in issues
@@ -946,6 +973,153 @@ def _calibration_gate(
     return True, []
 
 
+def _differential_readiness_gate(
+    source: dict[str, Any],
+    trial: dict[str, Any] | None,
+    manifest: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Bind a rejected absolute meter to an explicit paired-only estimand."""
+
+    if (
+        not isinstance(trial, dict)
+        or trial.get("comparison_mode") != PAIRED_DIFFERENTIAL_MODE
+        or trial.get("differential_readiness_bound") is not True
+        or trial.get("calibration_bound") is not False
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISSING"]
+    reference = trial.get("differential_readiness")
+    if not isinstance(reference, dict):
+        return False, ["DIFFERENTIAL_READINESS_MISSING"]
+    try:
+        raw_path = Path(reference["path"])
+        if raw_path.is_symlink() or not raw_path.is_file():
+            return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+        path = raw_path.resolve(strict=True)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False, ["DIFFERENTIAL_READINESS_MISSING"]
+    expected_sha = reference.get("sha256")
+    if not isinstance(expected_sha, str) or _sha256(path) != expected_sha:
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    try:
+        document = _json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 1
+        or document.get("record_type") != DIFFERENTIAL_READINESS_KIND
+        or document.get("eligible_for_comparison") is not False
+        or document.get("method")
+        != "pywattch.analysis.calibration.compare_sham_trials"
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    blockers = document.get("blockers")
+    if (
+        not isinstance(blockers, list)
+        or not {
+            "METER_PHASE_SENSITIVITY_REJECTED",
+            "MEASUREMENT_OVERHEAD_NOT_EVALUATED",
+        }.issubset(blockers)
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    meaningful = document.get("meaningful_effect")
+    threshold = (
+        meaningful.get("meaningful_effect_joules")
+        if isinstance(meaningful, dict)
+        else None
+    )
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or float(threshold) <= 0
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    instrumented_value = document.get("instrumented_path")
+    if not isinstance(instrumented_value, str) or not instrumented_value:
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    instrumented_path = Path(instrumented_value)
+    if not instrumented_path.is_absolute():
+        instrumented_path = path.parent / instrumented_path
+    try:
+        if instrumented_path.is_symlink() or not instrumented_path.is_file():
+            return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+        instrumented_path = instrumented_path.resolve(strict=True)
+    except OSError:
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    instrumented_sha = document.get("instrumented_sha256")
+    if (
+        not isinstance(instrumented_sha, str)
+        or _sha256(instrumented_path) != instrumented_sha
+        or reference.get("instrumented_sha256") != instrumented_sha
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    try:
+        instrumented = _json(instrumented_path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    if (
+        not isinstance(instrumented, dict)
+        or instrumented.get("schema_version") != 1
+        or instrumented.get("record_type")
+        != "wattch-meter-calibration-instrumented"
+        or not isinstance(instrumented.get("observations"), list)
+        or not instrumented["observations"]
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    boundary = instrumented.get("measurement_boundary")
+    labels = source.get("labels") if isinstance(source.get("labels"), dict) else {}
+    signatures = boundary.get("required_sources") if isinstance(boundary, dict) else None
+    matching = [
+        item
+        for item in signatures or []
+        if isinstance(item, dict)
+        and item.get("source_uid") == source.get("source_uid")
+    ]
+    if len(matching) != 1:
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    signature = matching[0]
+    expected_fields = {
+        "source_uid": source.get("source_uid"),
+        "kind": source.get("kind"),
+        "unit": source.get("unit"),
+        "temporality": source.get("temporality"),
+        "evidence_class": source.get("evidence_class"),
+        "parent_source_uid": source.get("parent_source_uid"),
+        "clock_domain": source.get("clock_domain"),
+        "interval_duration_source_uid": labels.get(
+            INTERVAL_DURATION_SOURCE_UID_LABEL
+        ),
+        "interval_timeline_reconstruction": labels.get(
+            INTERVAL_TIMELINE_RECONSTRUCTION_LABEL
+        ),
+    }
+    if (
+        not isinstance(boundary, dict)
+        or boundary.get("aggregation_rule") != "SINGLE_SOURCE"
+        or boundary.get("backend") != source.get("backend")
+        or boundary.get("primary_source_uids") != [source.get("source_uid")]
+        or any(signature.get(key) != value for key, value in expected_fields.items())
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    manifest_labels = manifest.get("labels")
+    nominal_period_ns = source.get("nominal_period_ns")
+    try:
+        labeled_interval_ns = int(manifest_labels["interval_ms"]) * 1_000_000
+    except (KeyError, TypeError, ValueError):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    if (
+        not isinstance(manifest_labels, dict)
+        or manifest_labels.get("comparison_mode") != PAIRED_DIFFERENTIAL_MODE
+        or manifest_labels.get("differential_readiness_sha256") != expected_sha
+        or manifest_labels.get("measurement_evidence_sha256") != expected_sha
+        or instrumented.get("interval_ns") != labeled_interval_ns
+        or nominal_period_ns != labeled_interval_ns
+    ):
+        return False, ["DIFFERENTIAL_READINESS_MISMATCH"]
+    return True, []
+
+
 def qualify_run(
     run_dir: Path,
     *,
@@ -1006,21 +1180,42 @@ def qualify_run(
         blockers.append("ARTIFACT_INVALID")
 
     source_uid = source_result.get("source_uid")
+    differential_requested = (
+        isinstance(trial, dict)
+        and trial.get("comparison_mode") == PAIRED_DIFFERENTIAL_MODE
+        and trial.get("differential_readiness_bound") is True
+    )
     quality_ok = False
     if isinstance(source_uid, str):
         quality_ok, quality_blockers = _quality_gate(
-            run, selected, trial, trace_evidence, sources
+            run,
+            selected,
+            trial,
+            trace_evidence,
+            sources,
+            allow_unevaluated_overhead=differential_requested,
         )
         blockers.extend(quality_blockers)
     else:
         blockers.append("QUALITY_MISSING")
-    calibration_bound, calibration_blockers = _calibration_gate(
-        run,
-        selected if isinstance(selected, dict) else {},
-        trial,
-        manifest if isinstance(manifest, dict) else {},
-    )
-    blockers.extend(calibration_blockers)
+    calibration_bound = False
+    differential_readiness_bound = False
+    if differential_requested:
+        differential_readiness_bound, evidence_blockers = (
+            _differential_readiness_gate(
+                selected if isinstance(selected, dict) else {},
+                trial,
+                manifest if isinstance(manifest, dict) else {},
+            )
+        )
+    else:
+        calibration_bound, evidence_blockers = _calibration_gate(
+            run,
+            selected if isinstance(selected, dict) else {},
+            trial,
+            manifest if isinstance(manifest, dict) else {},
+        )
+    blockers.extend(evidence_blockers)
 
     gates = {
         "descriptor_set_valid": not descriptor_blockers,
@@ -1034,8 +1229,24 @@ def qualify_run(
         "correctness_and_work_bound": trial is not None and not binding_blockers,
         "quality_accepted_and_bound": quality_ok,
         "calibration_bound": calibration_bound,
+        "differential_readiness_bound": differential_readiness_bound,
     }
-    descriptive = all(gates.values()) and not blockers
+    common_gate_names = (
+        "descriptor_set_valid",
+        "single_primary_source",
+        "source_semantics_supported",
+        "source_is_local_physical_candidate",
+        "core_artifact_files_present",
+        "trace_artifacts_decodable",
+        "capture_lifecycle_complete",
+        "correctness_and_work_bound",
+        "quality_accepted_and_bound",
+    )
+    common_eligible = all(gates[name] for name in common_gate_names)
+    descriptive = common_eligible and calibration_bound and not blockers
+    differential = (
+        common_eligible and differential_readiness_bound and not blockers
+    )
     # Schema v1 binds a local exploratory calibration, but does not carry an
     # independently verified factory-calibration attestation.
     confirmatory_calibration_verified = False
@@ -1051,6 +1262,13 @@ def qualify_run(
             "Schema-v1 calibration supports an exploratory local estimate only; "
             "it is not factory-verified confirmatory calibration."
         )
+    if differential_readiness_bound:
+        warnings.extend(
+            [
+                "The rejected absolute meter authorizes only an A/A-thresholded paired differential analysis.",
+                "The continuously running collector is part of this instrumented-system estimand; absolute energy remains ineligible.",
+            ]
+        )
     return {
         "schema_version": 1,
         "run": str(run),
@@ -1062,6 +1280,8 @@ def qualify_run(
         "outcome_computable": False,
         "descriptive_local_outcome_eligible": descriptive,
         "descriptive_local_run_eligible": descriptive,
+        "differential_local_outcome_eligible": differential,
+        "differential_local_run_eligible": differential,
         "confirmatory_calibration_verified": confirmatory_calibration_verified,
         "physical_run_claim_eligible": physical,
         "physical_comparison_claim_eligible": False,

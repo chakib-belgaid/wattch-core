@@ -56,4 +56,21 @@ Correctness is a gate. If outputs or useful work differ, do not call the candida
 
 Prefer repeated single-source joules only when every explicit source, artifact, correctness, quality, calibration, trace, and hash gate is eligible. Schema-v1 calibration authorizes only an exploratory `descriptive_local_run_eligible` result; it never sets physical or confirmatory claim flags. Eligibility fails closed when a gate is absent. Otherwise report duration, correctness, raw artifact paths, and plumbing status without inventing energy. Separate agent-workflow evidence from generated-code workload evidence.
 
+If absolute calibration fails phase sensitivity but a sealed A/A diagnostic is
+available, do not relabel it as a meter calibration. A separately preregistered
+`PAIRED_DIFFERENTIAL` study may compare the instrumented system only when:
+
+- every arm completes identical frozen work in every balanced block;
+- the raw source and native-duration companion pass trace-quality gates;
+- every marker window stays within the A/A calibration duration;
+- the complete matrix is retained without post-hoc exclusions;
+- the 95% paired interval excludes zero; and
+- the absolute mean difference strictly exceeds the frozen A/A meaningful-
+  effect floor.
+
+This pathway includes the continuously running collector in the observed
+system, keeps absolute joules and physical/confirmatory claims ineligible, and
+supports conclusions about these frozen implementations only—not model or
+skill population effects.
+
 Use [references/result-contract.md](references/result-contract.md) and [templates/result.md](templates/result.md). Include run IDs, source UID, boundary, backend, evidence class, marker window, repetitions, statistic, raw values, uncertainty, failures, and limitations.

@@ -157,8 +157,10 @@ python3 examples/agent-energy-benchmark/physical_study.py preflight \
 Preflight requires exactly one 250 ms Apple CPU interval-average source and its
 canonical native-duration companion. The plan polls the backend at 50 ms so a
 native frame is not lost when the tool's actual cadence is slightly slower than
-its requested 250 ms interval. The full run additionally requires a
-host-specific `METER_CALIBRATION` covering IDLE, FIXED_LOAD, and A/A regimes.
+its requested 250 ms interval. An absolute-exploratory run additionally
+requires a host-specific `METER_CALIBRATION` covering IDLE, FIXED_LOAD, and A/A
+regimes. A separate `PAIRED_DIFFERENTIAL` plan instead binds a sealed A/A
+readiness diagnostic and keeps absolute energy ineligible.
 Run preflight and the study from a macOS terminal context where `sandbox-exec`
 is permitted; a containing application sandbox may reject the nested profile.
 The lower-level schema-v1 artifact described in `clients/python/README.md` is
@@ -206,6 +208,25 @@ the lower-level exploratory workflow specified in
 [`docs/energy-impact-study.md`](../../docs/energy-impact-study.md#meter-calibration);
 do not create a placeholder calibration JSON.
 
+If absolute finalization rejects phase sensitivity, preserve that rejection.
+A fresh study plan may bind a separately sealed A/A diagnostic with
+`--differential-readiness` and retain a preregistered native telemetry tail
+with `--post-exit-capture-ms`. The verifier recomputes the diagnostic from its
+hashed instrumented artifact; it does not accept the diagnostic as a renamed
+`METER_CALIBRATION`.
+
+```bash
+python3 examples/agent-energy-benchmark/physical_study.py prepare \
+  --state /results/luna-control/state.json \
+          /results/luna-skill/state.json \
+          /results/terra-control/state.json \
+          /results/terra-skill/state.json \
+  --out /results/physical/paired-plan.json \
+  --plan-id agent-energy-paired-v1 \
+  --differential-readiness /results/physical/DIFFERENTIAL_READINESS.json \
+  --post-exit-capture-ms 19000
+```
+
 ```bash
 python3 examples/agent-energy-benchmark/physical_study.py run \
   --plan /results/physical/physical-plan.json \
@@ -215,6 +236,9 @@ python3 examples/agent-energy-benchmark/physical_study.py run \
   --out /results/physical/study-001
 ```
 
+For a `PAIRED_DIFFERENTIAL` plan, point `--plan` at the paired plan and omit
+`--calibration`; supplying a meter calibration in that mode is rejected.
+
 The runner executes balanced unmeasured warm-ups, waits for cooldown, then runs
 one measured qualification pilot. The 32-trial matrix starts only if the pilot
 passes exact-output, mutation-scope, lifecycle, source, native-sample, marker,
@@ -222,4 +246,8 @@ gap, quality, and calibration gates. Each repeated call uses a distinct seed so
 the declared useful work cannot collapse into a cached result. `RESULTS.json`
 contains paired estimates and bootstrap intervals, while
 `physical_comparison_claim_eligible` and remote-model/whole-machine claim flags
-remain false for this exploratory path.
+remain false for this exploratory path. In `PAIRED_DIFFERENTIAL` mode, a
+directional implementation finding additionally requires the complete eligible
+matrix, a deterministic paired bootstrap interval excluding zero, and an
+absolute mean difference strictly above the frozen A/A floor. One frozen
+submission per cell does not establish a model or skill population effect.

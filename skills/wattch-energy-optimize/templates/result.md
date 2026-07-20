@@ -16,8 +16,18 @@
 
 ## Results
 
-| condition | model | skill | trial/order | run id | correct | duration s | energy J | descriptive eligible | physical claim eligible | artifact |
-|---|---|---:|---|---|---:|---:|---:|---:|---:|---|
+| condition | model | skill | trial/order | run id | correct | duration s | source outcome J / null | descriptive eligible | differential eligible | physical claim eligible | artifact |
+|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|
+
+## Paired differential, if preregistered
+
+- Plan / SHA-256:
+- A/A readiness / SHA-256:
+- Complete eligible blocks:
+- Contrast floor / interaction floor:
+
+| paired contrast | raw block differences J | mean difference J | paired 95% interval J | frozen floor J | directional finding |
+|---|---|---:|---:|---:|---|
 
 ## Change and mechanism
 

@@ -146,6 +146,9 @@ def main() -> None:
         "descriptive_local_run_eligible": qualification[
             "descriptive_local_run_eligible"
         ],
+        "differential_local_run_eligible": qualification[
+            "differential_local_run_eligible"
+        ],
         "physical_comparison_claim_eligible": qualification[
             "physical_comparison_claim_eligible"
         ],

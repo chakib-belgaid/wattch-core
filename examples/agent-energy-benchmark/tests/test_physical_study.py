@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import statistics
+from statistics import NormalDist
 import subprocess
 import sys
 import tempfile
@@ -250,6 +252,119 @@ class PhysicalStudyTest(unittest.TestCase):
                     interval_ms=250,
                 )
 
+    def test_differential_readiness_recomputes_bound_aa_floor(self) -> None:
+        source = apple_source()
+        descriptors = [source, apple_duration()]
+        boundary = MeasurementBoundary.from_descriptors(
+            descriptors,
+            [source.source_uid],
+            boundary_id=physical_study.PHYSICAL_BOUNDARY_ID,
+        ).to_dict()
+        energies = {
+            "idle": ((50.0, 51.0), (60.0, 61.0)),
+            "fixed-load": ((100.0, 102.0), (110.0, 112.0)),
+            "aa": ((90.0, 92.0), (100.0, 102.0)),
+        }
+        observations = []
+        for regime, phases in energies.items():
+            for phase, repetitions in enumerate(phases):
+                for repetition, energy in enumerate(repetitions, start=1):
+                    observations.append(
+                        {
+                            "regime": regime,
+                            "phase_index": phase,
+                            "repetition": repetition,
+                            "marker_duration_s": 30.0,
+                            "energy_outcome": {"total_joules": energy},
+                        }
+                    )
+        differences = [10.0, 10.0, 10.0, 10.0]
+        mean = statistics.fmean(differences)
+        deviation = statistics.stdev(differences)
+        standard_error = deviation / len(differences) ** 0.5
+        critical = NormalDist().inv_cdf(0.975)
+        uncertainty = physical_study._linear_quantile(
+            [abs(value) for value in differences], 0.95
+        )
+        controls = [100.0, 102.0, 110.0, 112.0]
+        control_mean = statistics.fmean(controls)
+        threshold = max(0.05 * control_mean, 2.0 * uncertainty)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instrumented_path = root / "instrumented.json"
+            instrumented_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "wattch-meter-calibration-instrumented",
+                        "interval_ns": 250_000_000,
+                        "parameters": {"poll_interval_ms": 50},
+                        "measurement_boundary": boundary,
+                        "observations": observations,
+                    }
+                ),
+                "utf-8",
+            )
+            readiness = {
+                "schema_version": 1,
+                "record_type": physical_study.DIFFERENTIAL_READINESS_KIND,
+                "instrumented_path": "instrumented.json",
+                "instrumented_sha256": hashlib.sha256(
+                    instrumented_path.read_bytes()
+                ).hexdigest(),
+                "method": "pywattch.analysis.calibration.compare_sham_trials",
+                "comparison": {
+                    "contrast": "fixed-load-aa",
+                    "block_ids": ["p0-r1", "p0-r2", "p1-r1", "p1-r2"],
+                    "paired_differences_joules": differences,
+                    "mean_difference_joules": mean,
+                    "sample_standard_deviation_joules": deviation,
+                    "standard_error_joules": standard_error,
+                    "confidence": 0.95,
+                    "ci_lower_joules": mean - critical * standard_error,
+                    "ci_upper_joules": mean + critical * standard_error,
+                    "uncertainty_quantile": 0.95,
+                    "uncertainty_joules": uncertainty,
+                    "centers_on_zero": False,
+                },
+                "meaningful_effect": {
+                    "control_mean_joules": control_mean,
+                    "relative_floor_fraction": 0.05,
+                    "relative_floor_joules": 0.05 * control_mean,
+                    "aa_uncertainty_multiplier": 2.0,
+                    "aa_floor_joules": 2.0 * uncertainty,
+                    "meaningful_effect_joules": threshold,
+                },
+                "eligible_for_comparison": False,
+                "blockers": [
+                    "METER_PHASE_SENSITIVITY_REJECTED",
+                    "MEASUREMENT_OVERHEAD_NOT_EVALUATED",
+                ],
+            }
+            readiness_path = root / "readiness.json"
+            readiness_path.write_text(json.dumps(readiness), "utf-8")
+
+            accepted = physical_study.validate_differential_readiness(
+                readiness_path,
+                source=source,
+                descriptors=descriptors,
+                interval_ms=250,
+            )
+            self.assertEqual(accepted["meaningful_effect_joules"], threshold)
+            self.assertEqual(
+                accepted["evidence_level"], "EXPLORATORY_PAIRED_DIFFERENTIAL"
+            )
+
+            readiness["comparison"]["mean_difference_joules"] = 11.0
+            readiness_path.write_text(json.dumps(readiness), "utf-8")
+            with self.assertRaisesRegex(ValueError, "mean_difference_joules"):
+                physical_study.validate_differential_readiness(
+                    readiness_path,
+                    source=source,
+                    descriptors=descriptors,
+                    interval_ms=250,
+                )
+
     def test_inspection_gate_rejects_incomplete_or_sparse_capture(self) -> None:
         source = apple_source().to_dict()
         inspection = {
@@ -392,6 +507,74 @@ class PhysicalStudyTest(unittest.TestCase):
             accepted["claims"]["descriptive_local_comparison_eligible"]
         )
         self.assertFalse(accepted["claims"]["physical_comparison_claim_eligible"])
+
+    def test_differential_aggregate_applies_frozen_floor_and_interval(self) -> None:
+        schedule = physical_study.build_schedule(
+            physical_study.CANONICAL_CONDITIONS,
+            blocks=4,
+            seed=13,
+            plan_id="paired-v1",
+        )
+        plan = {
+            "plan_id": "paired-v1",
+            "design": {"blocks": 4, "schedule_seed": 13, "schedule": schedule},
+            "analysis": {
+                "mode": physical_study.PAIRED_DIFFERENTIAL_MODE,
+                "meaningful_effect_joules": 20.0,
+                "interaction_threshold_multiplier": 2.0,
+            },
+        }
+        readiness = {
+            "selected_source": apple_source().to_dict(),
+            "comparison_mode": physical_study.PAIRED_DIFFERENTIAL_MODE,
+            "descriptive_comparison_ready": False,
+            "differential_comparison_ready": True,
+            "limitations": ["paired only"],
+        }
+        energy = {
+            "luna-control": 100.0,
+            "luna-skill": 200.0,
+            "terra-control": 150.0,
+            "terra-skill": 120.0,
+        }
+
+        def trial(item: dict[str, object]) -> dict[str, object]:
+            value = energy[str(item["condition"])]
+            return {
+                "schedule": item,
+                "record": {
+                    "descriptive_local_run_eligible": False,
+                    "differential_local_run_eligible": True,
+                    "run_blockers": [],
+                },
+                "summary": {
+                    "descriptive_local_run_eligible": False,
+                    "differential_local_run_eligible": True,
+                    "outcome": {"total_joules": value, "duration_s": 10.0},
+                },
+            }
+
+        result = physical_study.aggregate_study(
+            plan,
+            readiness=readiness,
+            trials=[trial(item) for item in schedule],
+        )
+
+        self.assertTrue(result["matrix_complete"])
+        self.assertFalse(
+            result["claims"]["descriptive_local_comparison_eligible"]
+        )
+        self.assertTrue(
+            result["claims"][
+                "exploratory_paired_differential_comparison_eligible"
+            ]
+        )
+        self.assertTrue(
+            result["paired_contrasts"]["luna_skill_minus_control"][
+                "directional_difference_detected"
+            ]
+        )
+        self.assertFalse(result["claims"]["physical_comparison_claim_eligible"])
 
     def test_aggregate_rejects_an_empty_zero_block_matrix(self) -> None:
         plan = {

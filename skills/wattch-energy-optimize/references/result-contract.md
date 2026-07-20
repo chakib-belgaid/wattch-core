@@ -24,6 +24,7 @@ sampling_mode
 evidence_class
 energy_joules_or_null
 descriptive_local_run_eligible
+differential_local_run_eligible
 physical_claim_eligible
 failure_or_warning
 ```
@@ -47,5 +48,13 @@ Allowed synthetic conclusion:
 Allowed exploratory local-domain conclusion when every schema-v1 gate passes:
 
 > In this exploratory local-domain estimate for the frozen host, source, and workload, the candidate had a lower median source-domain outcome while preserving declared output and useful work. This is not a confirmatory physical-energy claim.
+
+Allowed paired-differential conclusion when the absolute meter is rejected but
+the frozen A/A decision rule passes:
+
+> For this complete paired study of the four frozen implementations, the local
+> instrumented-system CPU-domain difference exceeded the preregistered A/A
+> floor and its paired interval excluded zero. Absolute energy, model-level,
+> skill-level, whole-machine, and remote-inference claims remain ineligible.
 
 Never say the result is the model's datacenter energy, total-machine energy, carbon footprint, or process-private consumption unless those boundaries were independently measured.

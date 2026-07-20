@@ -18,6 +18,7 @@ from evidence_contract import (  # noqa: E402
     _calibration_gate,
     _cli_lifecycle,
     _descriptor_set,
+    _differential_readiness_gate,
     _quality_gate,
     _trace_gate,
     classify_source,
@@ -327,6 +328,18 @@ class CheckEvidenceTest(unittest.TestCase):
         _sources, blockers = _descriptor_set([power, duration])
         self.assertEqual(blockers, [])
 
+        v2_power = {
+            **power,
+            "labels": {
+                **labels,
+                "wattch.interval_timeline_reconstruction": (
+                    "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+                ),
+            },
+        }
+        _sources, blockers = _descriptor_set([v2_power, duration])
+        self.assertEqual(blockers, [])
+
         for key, bad_value in (
             ("backend", "other-backend"),
             ("evidence_class", "RAW_SENSOR_READING"),
@@ -442,6 +455,114 @@ class CheckEvidenceTest(unittest.TestCase):
 
         self.assertFalse(accepted)
         self.assertEqual(blockers, ["CALIBRATION_MISMATCH"])
+
+    def test_differential_readiness_remains_paired_only(self) -> None:
+        duration_uid = "powermetrics://node/frame/elapsed_ns"
+        item = source(
+            backend="apple-powermetrics",
+            evidence_class="TOOL_DERIVED_ESTIMATE",
+            kind="CPU_POWER",
+            unit="MILLIWATT",
+            temporality="INTERVAL_AVERAGE",
+            source_uid="powermetrics://node/processor.cpu_power",
+            labels={
+                "wattch.interval_duration_source_uid": duration_uid,
+                "wattch.interval_timeline_reconstruction": (
+                    "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+                ),
+            },
+        )
+        signature = {
+            "source_uid": item["source_uid"],
+            "kind": item["kind"],
+            "unit": item["unit"],
+            "temporality": item["temporality"],
+            "evidence_class": item["evidence_class"],
+            "parent_source_uid": item["parent_source_uid"],
+            "clock_domain": item["clock_domain"],
+            "interval_duration_source_uid": duration_uid,
+            "interval_timeline_reconstruction": (
+                "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instrumented = root / "instrumented.json"
+            instrumented.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "wattch-meter-calibration-instrumented",
+                        "interval_ns": 100_000_000,
+                        "measurement_boundary": {
+                            "boundary_id": "apple-cpu",
+                            "backend": item["backend"],
+                            "primary_source_uids": [item["source_uid"]],
+                            "aggregation_rule": "SINGLE_SOURCE",
+                            "required_sources": [signature],
+                        },
+                        "observations": [{"observation_id": "aa-1"}],
+                    }
+                ),
+                "utf-8",
+            )
+            readiness = root / "differential.json"
+            readiness.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": (
+                            "wattch-agent-differential-readiness-diagnostic"
+                        ),
+                        "instrumented_path": "instrumented.json",
+                        "instrumented_sha256": sha256(instrumented),
+                        "method": (
+                            "pywattch.analysis.calibration.compare_sham_trials"
+                        ),
+                        "comparison": {},
+                        "meaningful_effect": {
+                            "meaningful_effect_joules": 72.0
+                        },
+                        "eligible_for_comparison": False,
+                        "blockers": [
+                            "METER_PHASE_SENSITIVITY_REJECTED",
+                            "MEASUREMENT_OVERHEAD_NOT_EVALUATED",
+                        ],
+                    }
+                ),
+                "utf-8",
+            )
+            readiness_sha = sha256(readiness)
+            trial = {
+                "comparison_mode": "PAIRED_DIFFERENTIAL",
+                "calibration_bound": False,
+                "differential_readiness_bound": True,
+                "differential_readiness": {
+                    "path": str(readiness),
+                    "sha256": readiness_sha,
+                    "instrumented_sha256": sha256(instrumented),
+                },
+            }
+            manifest = {
+                "labels": {
+                    "interval_ms": "100",
+                    "comparison_mode": "PAIRED_DIFFERENTIAL",
+                    "differential_readiness_sha256": readiness_sha,
+                    "measurement_evidence_sha256": readiness_sha,
+                }
+            }
+
+            accepted, blockers = _differential_readiness_gate(
+                item, trial, manifest
+            )
+            self.assertTrue(accepted, blockers)
+
+            trial["calibration_bound"] = True
+            accepted, blockers = _differential_readiness_gate(
+                item, trial, manifest
+            )
+            self.assertFalse(accepted)
+            self.assertEqual(blockers, ["DIFFERENTIAL_READINESS_MISSING"])
 
     def test_all_explicit_gates_can_enable_one_local_run(self) -> None:
         item = source()

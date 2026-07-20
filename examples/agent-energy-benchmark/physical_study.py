@@ -20,6 +20,7 @@ import random
 import signal
 import shutil
 import statistics
+from statistics import NormalDist
 import subprocess
 import sys
 import time
@@ -55,6 +56,9 @@ from summarize_run import select_window  # noqa: E402
 SCHEMA_VERSION = 1
 PLAN_KIND = "wattch-agent-physical-study-plan"
 RESULT_KIND = "wattch-agent-physical-study-result"
+DIFFERENTIAL_READINESS_KIND = "wattch-agent-differential-readiness-diagnostic"
+ABSOLUTE_EXPLORATORY_MODE = "ABSOLUTE_EXPLORATORY"
+PAIRED_DIFFERENTIAL_MODE = "PAIRED_DIFFERENTIAL"
 CANONICAL_CONDITIONS = (
     "luna-control",
     "luna-skill",
@@ -121,6 +125,17 @@ EXPLORATORY_CALIBRATION_FIELDS = {
     "required_regimes",
     "selected_metrics",
     "thresholds",
+}
+DIFFERENTIAL_READINESS_FIELDS = {
+    "schema_version",
+    "record_type",
+    "instrumented_path",
+    "instrumented_sha256",
+    "method",
+    "comparison",
+    "meaningful_effect",
+    "eligible_for_comparison",
+    "blockers",
 }
 
 
@@ -374,6 +389,83 @@ def prepare_plan(args: argparse.Namespace) -> dict[str, object]:
         "condition": "luna-control",
         "run_id": f"{plan_id}-qualification-pilot",
     }
+    differential_path = getattr(args, "differential_readiness", None)
+    analysis: dict[str, object] = {"mode": ABSOLUTE_EXPLORATORY_MODE}
+    if differential_path is not None:
+        readiness_path = differential_path.resolve(strict=True)
+        readiness_document = read_json(readiness_path)
+        if (
+            readiness_document.get("schema_version") != 1
+            or readiness_document.get("record_type")
+            != DIFFERENTIAL_READINESS_KIND
+            or set(readiness_document) != DIFFERENTIAL_READINESS_FIELDS
+        ):
+            raise ValueError("differential readiness schema is invalid")
+        meaningful = readiness_document.get("meaningful_effect")
+        readiness_comparison = readiness_document.get("comparison")
+        if not isinstance(meaningful, dict) or not isinstance(
+            readiness_comparison, dict
+        ):
+            raise ValueError("differential readiness decision rule is missing")
+        threshold = _finite_float(
+            meaningful.get("meaningful_effect_joules"),
+            "meaningful effect",
+        )
+        confidence = _finite_float(
+            readiness_comparison.get("confidence"), "confidence"
+        )
+        if threshold <= 0 or confidence != 0.95:
+            raise ValueError("differential readiness decision rule is invalid")
+        instrumented_value = readiness_document.get("instrumented_path")
+        if not isinstance(instrumented_value, str) or not instrumented_value:
+            raise ValueError("differential readiness instrumented path is invalid")
+        instrumented_path = Path(instrumented_value)
+        if not instrumented_path.is_absolute():
+            instrumented_path = readiness_path.parent / instrumented_path
+        instrumented_path = instrumented_path.resolve(strict=True)
+        if hash_file(instrumented_path) != readiness_document.get(
+            "instrumented_sha256"
+        ):
+            raise ValueError("differential readiness instrumented hash differs")
+        instrumented = read_json(instrumented_path)
+        parameters = instrumented.get("parameters")
+        if (
+            not isinstance(parameters, dict)
+            or parameters.get("poll_interval_ms") != args.poll_interval_ms
+        ):
+            raise ValueError(
+                "differential study poll interval must match its A/A collection"
+            )
+        durations = [
+            _finite_float(item.get("marker_duration_s"), "marker duration")
+            for item in instrumented.get("observations", [])
+            if isinstance(item, dict)
+        ]
+        if not durations or min(durations) <= 0:
+            raise ValueError("differential readiness has no calibration duration")
+        analysis = {
+            "mode": PAIRED_DIFFERENTIAL_MODE,
+            "differential_readiness_path": str(readiness_path),
+            "differential_readiness_sha256": hash_file(readiness_path),
+            "instrumented_path": str(instrumented_path),
+            "instrumented_sha256": hash_file(instrumented_path),
+            "confidence": confidence,
+            "meaningful_effect_joules": threshold,
+            "interaction_threshold_multiplier": 2.0,
+            "maximum_calibrated_marker_duration_s": max(durations),
+            "max_missing_sample_ratio": 0.001,
+            "decision_rule": (
+                "retain a directional implementation contrast only when the "
+                "complete paired matrix is eligible, the deterministic "
+                "bootstrap 95% interval excludes zero, and the absolute mean "
+                "difference strictly exceeds the A/A meaningful-effect floor"
+            ),
+            "claim_scope": (
+                "exploratory local CPU-domain difference for the instrumented "
+                "system; no absolute, whole-machine, remote-inference, model-"
+                "population, or confirmatory claim"
+            ),
+        }
     plan: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "record_type": PLAN_KIND,
@@ -428,6 +520,7 @@ def prepare_plan(args: argparse.Namespace) -> dict[str, object]:
             "evidence_class": "TOOL_DERIVED_ESTIMATE",
             "interval_ms": args.interval_ms,
             "poll_interval_ms": args.poll_interval_ms,
+            "post_exit_capture_ms": args.post_exit_capture_ms,
             "minimum_target_duration_s": args.minimum_target_duration_s,
             "minimum_selected_source_samples": args.minimum_samples,
             "cooldown_s": args.cooldown_s,
@@ -439,6 +532,7 @@ def prepare_plan(args: argparse.Namespace) -> dict[str, object]:
             "qualification_pilot": pilot,
             "schedule": schedule,
         },
+        "analysis": analysis,
         "claim_scope": {
             "local_generated_code_source_domain_only": True,
             "remote_model_inference_observed": False,
@@ -469,6 +563,7 @@ def _validate_plan_bounds(plan: dict[str, Any]) -> None:
     interval_ms = acquisition.get("interval_ms")
     poll_interval_ms = acquisition.get("poll_interval_ms")
     minimum_samples = acquisition.get("minimum_selected_source_samples")
+    post_exit_capture_ms = acquisition.get("post_exit_capture_ms", 0)
     if (
         isinstance(interval_ms, bool)
         or not isinstance(interval_ms, int)
@@ -480,6 +575,9 @@ def _validate_plan_bounds(plan: dict[str, Any]) -> None:
         or isinstance(minimum_samples, bool)
         or not isinstance(minimum_samples, int)
         or minimum_samples < 10
+        or isinstance(post_exit_capture_ms, bool)
+        or not isinstance(post_exit_capture_ms, int)
+        or not 0 <= post_exit_capture_ms <= 60_000
     ):
         raise ValueError(
             "acquisition must poll at least twice per native interval and "
@@ -513,6 +611,43 @@ def _validate_plan_bounds(plan: dict[str, Any]) -> None:
         or not isinstance(schedule_seed, int)
     ):
         raise ValueError("study design bounds are invalid")
+
+    analysis = plan.get("analysis", {"mode": ABSOLUTE_EXPLORATORY_MODE})
+    if not isinstance(analysis, dict) or analysis.get("mode") not in {
+        ABSOLUTE_EXPLORATORY_MODE,
+        PAIRED_DIFFERENTIAL_MODE,
+    }:
+        raise ValueError("study analysis mode is invalid")
+    if analysis.get("mode") == PAIRED_DIFFERENTIAL_MODE:
+        for key in (
+            "differential_readiness_path",
+            "differential_readiness_sha256",
+            "instrumented_path",
+            "instrumented_sha256",
+            "decision_rule",
+            "claim_scope",
+        ):
+            if not isinstance(analysis.get(key), str) or not analysis[key]:
+                raise ValueError(f"differential analysis {key} is invalid")
+        for key in (
+            "confidence",
+            "meaningful_effect_joules",
+            "interaction_threshold_multiplier",
+            "maximum_calibrated_marker_duration_s",
+            "max_missing_sample_ratio",
+        ):
+            value = analysis.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"differential analysis {key} is invalid")
+        if analysis["confidence"] != 0.95:
+            raise ValueError("differential analysis confidence must be 0.95")
+        if not 0 < float(analysis["max_missing_sample_ratio"]) <= 0.001:
+            raise ValueError("differential analysis missingness limit is invalid")
 
 
 def verify_plan(plan: dict[str, Any]) -> None:
@@ -586,6 +721,15 @@ def verify_plan(plan: dict[str, Any]) -> None:
         in {item["run_id"] for item in design["schedule"]}
     ):
         raise ValueError("qualification pilot is invalid")
+    analysis = plan.get("analysis", {"mode": ABSOLUTE_EXPLORATORY_MODE})
+    if analysis.get("mode") == PAIRED_DIFFERENTIAL_MODE:
+        for path_key, sha_key in (
+            ("differential_readiness_path", "differential_readiness_sha256"),
+            ("instrumented_path", "instrumented_sha256"),
+        ):
+            path = Path(analysis[path_key]).resolve(strict=True)
+            if hash_file(path) != analysis[sha_key]:
+                raise ValueError(f"plan-bound differential evidence changed: {path}")
 
 
 def verify_runtime_bindings(
@@ -624,6 +768,17 @@ def verify_runtime_bindings(
         path = Path(workload[path_key]).resolve(strict=True)
         if hash_file(path) != workload[sha_key]:
             raise ValueError(f"plan-bound runtime changed during execution: {path}")
+    analysis = plan.get("analysis", {"mode": ABSOLUTE_EXPLORATORY_MODE})
+    if analysis.get("mode") == PAIRED_DIFFERENTIAL_MODE:
+        for path_key, sha_key in (
+            ("differential_readiness_path", "differential_readiness_sha256"),
+            ("instrumented_path", "instrumented_sha256"),
+        ):
+            path = Path(analysis[path_key]).resolve(strict=True)
+            if hash_file(path) != analysis[sha_key]:
+                raise ValueError(
+                    f"plan-bound differential evidence changed during execution: {path}"
+                )
 
 
 def select_physical_source(
@@ -739,6 +894,276 @@ def validate_calibration(
     }
 
 
+def _finite_float(value: object, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"differential readiness {label} must be finite")
+    return float(value)
+
+
+def _assert_close(observed: object, expected: float, label: str) -> None:
+    value = _finite_float(observed, label)
+    if not math.isclose(value, expected, rel_tol=1e-12, abs_tol=1e-9):
+        raise ValueError(f"differential readiness {label} is inconsistent")
+
+
+def _linear_quantile(values: list[float], probability: float) -> float:
+    if not values or not 0 <= probability <= 1:
+        raise ValueError("linear quantile needs values and a probability in [0, 1]")
+    ordered = sorted(values)
+    position = probability * (len(ordered) - 1)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    fraction = position - lower_index
+    return (
+        ordered[lower_index] * (1 - fraction)
+        + ordered[upper_index] * fraction
+    )
+
+
+def validate_differential_readiness(
+    path: Path,
+    *,
+    source: SourceDescriptor,
+    descriptors: Iterable[SourceDescriptor],
+    interval_ms: int,
+) -> dict[str, Any]:
+    """Validate the sealed A/A floor without accepting the rejected meter.
+
+    This evidence authorizes only an exploratory within-block differential
+    analysis whose continuous collector is part of the observed system.  It
+    never becomes a ``METER_CALIBRATION`` and cannot authorize absolute or
+    confirmatory energy claims.
+    """
+
+    descriptors = tuple(descriptors)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            "differential readiness must be one regular, non-symlink file"
+        )
+    path = path.resolve(strict=True)
+    document = read_json(path)
+    if (
+        document.get("schema_version") != 1
+        or document.get("record_type") != DIFFERENTIAL_READINESS_KIND
+        or set(document) != DIFFERENTIAL_READINESS_FIELDS
+    ):
+        raise ValueError("differential readiness schema is invalid")
+    if document.get("method") != "pywattch.analysis.calibration.compare_sham_trials":
+        raise ValueError("differential readiness method is not canonical")
+    if document.get("eligible_for_comparison") is not False:
+        raise ValueError("rejected absolute calibration must remain ineligible")
+    blockers = document.get("blockers")
+    if (
+        not isinstance(blockers, list)
+        or not {
+            "METER_PHASE_SENSITIVITY_REJECTED",
+            "MEASUREMENT_OVERHEAD_NOT_EVALUATED",
+        }.issubset(blockers)
+    ):
+        raise ValueError("differential readiness must preserve absolute-meter blockers")
+
+    instrumented_value = document.get("instrumented_path")
+    if not isinstance(instrumented_value, str) or not instrumented_value:
+        raise ValueError("differential readiness instrumented path is invalid")
+    instrumented_path = Path(instrumented_value)
+    if not instrumented_path.is_absolute():
+        instrumented_path = path.parent / instrumented_path
+    if instrumented_path.is_symlink() or not instrumented_path.is_file():
+        raise ValueError("bound instrumented calibration record is missing")
+    instrumented_path = instrumented_path.resolve(strict=True)
+    if hash_file(instrumented_path) != document.get("instrumented_sha256"):
+        raise ValueError("bound instrumented calibration hash differs")
+    instrumented = read_json(instrumented_path)
+    if (
+        instrumented.get("schema_version") != 1
+        or instrumented.get("record_type")
+        != "wattch-meter-calibration-instrumented"
+        or instrumented.get("interval_ns") != interval_ms * 1_000_000
+    ):
+        raise ValueError("bound instrumented calibration metadata differs")
+    parameters = instrumented.get("parameters")
+    poll_interval_ms = (
+        parameters.get("poll_interval_ms")
+        if isinstance(parameters, dict)
+        else None
+    )
+    if (
+        isinstance(poll_interval_ms, bool)
+        or not isinstance(poll_interval_ms, int)
+        or poll_interval_ms <= 0
+    ):
+        raise ValueError("bound instrumented calibration poll interval is invalid")
+    boundary_value = instrumented.get("measurement_boundary")
+    if not isinstance(boundary_value, dict):
+        raise ValueError("bound instrumented calibration lacks a boundary")
+    boundary = MeasurementBoundary.from_dict(boundary_value)
+    expected_boundary = MeasurementBoundary.from_descriptors(
+        descriptors,
+        [source.source_uid],
+        boundary_id=PHYSICAL_BOUNDARY_ID,
+    )
+    if boundary != expected_boundary or boundary.validate_descriptors(descriptors) != (
+        source,
+    ):
+        raise ValueError("differential readiness boundary differs from the live source")
+
+    observations = instrumented.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise ValueError("bound instrumented calibration has no observations")
+    by_regime_key: dict[tuple[str, int, int], float] = {}
+    phase_groups: dict[str, dict[int, list[float]]] = {}
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise ValueError("instrumented calibration observation is invalid")
+        regime = observation.get("regime")
+        phase = observation.get("phase_index")
+        repetition = observation.get("repetition")
+        outcome = observation.get("energy_outcome")
+        if (
+            regime not in {"idle", "fixed-load", "aa"}
+            or isinstance(phase, bool)
+            or not isinstance(phase, int)
+            or phase < 0
+            or isinstance(repetition, bool)
+            or not isinstance(repetition, int)
+            or repetition <= 0
+            or not isinstance(outcome, dict)
+        ):
+            raise ValueError("instrumented calibration observation labels are invalid")
+        energy = _finite_float(outcome.get("total_joules"), "energy outcome")
+        if energy <= 0:
+            raise ValueError("instrumented calibration energy must be positive")
+        key = (regime, phase, repetition)
+        if key in by_regime_key:
+            raise ValueError("instrumented calibration duplicates a regime cell")
+        by_regime_key[key] = energy
+        phase_groups.setdefault(regime, {}).setdefault(phase, []).append(energy)
+
+    fixed_keys = {
+        (phase, repetition)
+        for regime, phase, repetition in by_regime_key
+        if regime == "fixed-load"
+    }
+    aa_keys = {
+        (phase, repetition)
+        for regime, phase, repetition in by_regime_key
+        if regime == "aa"
+    }
+    if not fixed_keys or fixed_keys != aa_keys:
+        raise ValueError("instrumented calibration lacks matched fixed-load/A/A cells")
+    ordered_keys = sorted(fixed_keys)
+    block_ids = [f"p{phase}-r{repetition}" for phase, repetition in ordered_keys]
+    differences = [
+        by_regime_key[("fixed-load", phase, repetition)]
+        - by_regime_key[("aa", phase, repetition)]
+        for phase, repetition in ordered_keys
+    ]
+    controls = [
+        by_regime_key[("fixed-load", phase, repetition)]
+        for phase, repetition in ordered_keys
+    ]
+    comparison = document.get("comparison")
+    if (
+        not isinstance(comparison, dict)
+        or comparison.get("contrast") != "fixed-load-aa"
+        or comparison.get("block_ids") != block_ids
+    ):
+        raise ValueError("differential readiness pairing labels differ")
+    recorded_differences = comparison.get("paired_differences_joules")
+    if (
+        not isinstance(recorded_differences, list)
+        or len(recorded_differences) != len(differences)
+    ):
+        raise ValueError("differential readiness paired differences are incomplete")
+    for index, (observed, expected) in enumerate(
+        zip(recorded_differences, differences)
+    ):
+        _assert_close(observed, expected, f"paired difference {index}")
+
+    confidence = _finite_float(comparison.get("confidence"), "confidence")
+    if confidence != 0.95 or len(differences) < 2:
+        raise ValueError("differential readiness confidence contract is invalid")
+    mean = statistics.fmean(differences)
+    deviation = statistics.stdev(differences)
+    standard_error = deviation / math.sqrt(len(differences))
+    critical = NormalDist().inv_cdf((1 + confidence) / 2)
+    lower = mean - critical * standard_error
+    upper = mean + critical * standard_error
+    for key, expected in (
+        ("mean_difference_joules", mean),
+        ("sample_standard_deviation_joules", deviation),
+        ("standard_error_joules", standard_error),
+        ("ci_lower_joules", lower),
+        ("ci_upper_joules", upper),
+    ):
+        _assert_close(comparison.get(key), expected, key)
+    if comparison.get("centers_on_zero") is not (lower <= 0 <= upper):
+        raise ValueError("differential readiness zero-centering flag differs")
+    quantile = _finite_float(
+        comparison.get("uncertainty_quantile"), "uncertainty quantile"
+    )
+    if quantile != 0.95:
+        raise ValueError("differential readiness uncertainty quantile differs")
+    uncertainty = _linear_quantile(
+        [abs(value) for value in differences], quantile
+    )
+    _assert_close(comparison.get("uncertainty_joules"), uncertainty, "uncertainty")
+
+    meaningful = document.get("meaningful_effect")
+    if not isinstance(meaningful, dict):
+        raise ValueError("differential readiness meaningful-effect rule is missing")
+    control_mean = statistics.fmean(controls)
+    fraction = _finite_float(
+        meaningful.get("relative_floor_fraction"), "relative floor fraction"
+    )
+    multiplier = _finite_float(
+        meaningful.get("aa_uncertainty_multiplier"), "A/A multiplier"
+    )
+    if fraction != 0.05 or multiplier != 2.0:
+        raise ValueError("differential readiness decision factors differ")
+    relative_floor = fraction * control_mean
+    aa_floor = multiplier * uncertainty
+    threshold = max(relative_floor, aa_floor)
+    for key, expected in (
+        ("control_mean_joules", control_mean),
+        ("relative_floor_joules", relative_floor),
+        ("aa_floor_joules", aa_floor),
+        ("meaningful_effect_joules", threshold),
+    ):
+        _assert_close(meaningful.get(key), expected, key)
+
+    phase_sensitivity: dict[str, float] = {}
+    for regime in ("idle", "fixed-load", "aa"):
+        groups = phase_groups.get(regime, {})
+        if len(groups) < 2:
+            raise ValueError("instrumented calibration lacks phase groups")
+        means = [statistics.fmean(values) for values in groups.values()]
+        phase_sensitivity[regime] = (
+            max(means) - min(means)
+        ) / statistics.fmean(means)
+    if any(value < 0.01 for value in phase_sensitivity.values()):
+        raise ValueError("differential readiness does not prove the rejected phase gate")
+
+    return {
+        "path": str(path),
+        "sha256": hash_file(path),
+        "document": document,
+        "instrumented_path": str(instrumented_path),
+        "instrumented_sha256": hash_file(instrumented_path),
+        "measurement_boundary": boundary.to_dict(),
+        "meaningful_effect_joules": threshold,
+        "poll_interval_ms": poll_interval_ms,
+        "phase_sensitivity_ratio": phase_sensitivity,
+        "evidence_level": "EXPLORATORY_PAIRED_DIFFERENTIAL",
+    }
+
+
 def preflight(
     plan: dict[str, Any], *, socket: Path, calibration_path: Path | None
 ) -> dict[str, object]:
@@ -759,28 +1184,60 @@ def preflight(
             "clock_instance_id": client.clock_instance_id,
             "protocol_version": client.protocol_version,
         }
-    calibration = (
-        validate_calibration(
+    analysis = plan.get("analysis", {"mode": ABSOLUTE_EXPLORATORY_MODE})
+    comparison_mode = analysis.get("mode", ABSOLUTE_EXPLORATORY_MODE)
+    if comparison_mode == PAIRED_DIFFERENTIAL_MODE and calibration_path is not None:
+        raise ValueError(
+            "paired differential mode cannot be relabeled with a meter calibration"
+        )
+    calibration = None
+    differential_readiness = None
+    if comparison_mode == PAIRED_DIFFERENTIAL_MODE:
+        differential_readiness = validate_differential_readiness(
+            Path(analysis["differential_readiness_path"]),
+            source=source,
+            descriptors=descriptors,
+            interval_ms=plan["acquisition"]["interval_ms"],
+        )
+        if (
+            differential_readiness["sha256"]
+            != analysis["differential_readiness_sha256"]
+            or differential_readiness["instrumented_sha256"]
+            != analysis["instrumented_sha256"]
+            or not math.isclose(
+                float(differential_readiness["meaningful_effect_joules"]),
+                float(analysis["meaningful_effect_joules"]),
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            )
+            or differential_readiness["poll_interval_ms"]
+            != plan["acquisition"]["poll_interval_ms"]
+        ):
+            raise ValueError("plan-bound differential readiness differs at preflight")
+    elif calibration_path is not None:
+        calibration = validate_calibration(
             calibration_path,
             source=source,
             descriptors=descriptors,
             interval_ms=plan["acquisition"]["interval_ms"],
         )
-        if calibration_path is not None
-        else None
-    )
     return {
         "source_ready": True,
         "descriptive_comparison_ready": calibration is not None,
+        "differential_comparison_ready": differential_readiness is not None,
         "confirmatory_comparison_ready": False,
+        "comparison_mode": comparison_mode,
         "daemon": daemon,
         "selected_source": source.to_dict(),
         "measurement_boundary": boundary.to_dict(),
         "calibration": calibration,
+        "differential_readiness": differential_readiness,
         "limitations": [
             "The boundary is a local Apple CPU-domain tool estimate, not whole-machine energy.",
             "Local capture does not observe Luna or Terra inference in the provider datacenter.",
             "Schema-v1 calibration supports exploratory estimates, not a confirmatory claim.",
+            "Paired differential mode includes the continuously running collector in the observed system and does not authorize an absolute-energy estimate.",
+            "One frozen implementation per cell does not estimate a model or skill population effect.",
             "Williams carryover balance is within blocks; cooldown is not a verified thermal reset.",
         ],
     }
@@ -959,6 +1416,63 @@ def _write_quality(
     return quality
 
 
+def differential_quality_eligible(quality: dict[str, object]) -> bool:
+    """Accept trace quality while preserving unevaluated-overhead review.
+
+    The differential estimand includes the continuously running collector, so
+    unevaluated collector overhead is an explicit limitation rather than a
+    fabricated zero.  Every source-quality error still fails closed.
+    """
+
+    issues = quality.get("issues")
+    if not isinstance(issues, list):
+        return False
+    if any(
+        not isinstance(issue, dict)
+        or issue.get("severity") == "ERROR"
+        or (
+            issue.get("code") != "OVERHEAD_NOT_EVALUATED"
+            and issue.get("severity") == "WARNING"
+        )
+        for issue in issues
+    ):
+        return False
+    return (
+        quality.get("disposition") in {"ACCEPTED", "REVIEW_REQUIRED"}
+        and quality.get("measurement_overhead_ratio") is None
+    )
+
+
+def matched_execution_fingerprint(
+    plan: dict[str, Any], *, block: int, target_nice: int
+) -> str:
+    workload = plan["workload"]
+    contract = {
+        "schema_version": 1,
+        "plan_id": plan["plan_id"],
+        "block": block,
+        "prompt_sha256": plan["common"]["prompt_sha256"],
+        "events": workload["events"],
+        "accounts": workload["accounts"],
+        "seed": workload["seed"],
+        "repeat": workload["repeat"],
+        "iterations": workload["iterations"],
+        "driver_sha256": workload["driver_sha256"],
+        "python_sha256": workload["python_sha256"],
+        "sandbox_exec_sha256": workload["sandbox_exec_sha256"],
+        "target_nice": target_nice,
+        "interval_ms": plan["acquisition"]["interval_ms"],
+        "poll_interval_ms": plan["acquisition"]["poll_interval_ms"],
+        "post_exit_capture_ms": plan["acquisition"].get(
+            "post_exit_capture_ms", 0
+        ),
+        "comparison_mode": plan.get("analysis", {}).get(
+            "mode", ABSOLUTE_EXPLORATORY_MODE
+        ),
+    }
+    return sha256_bytes(canonical_json_bytes(contract))
+
+
 def _condition_map(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(item["id"]): item for item in plan["conditions"]}
 
@@ -968,7 +1482,8 @@ def _labels(
     item: dict[str, Any],
     condition: dict[str, Any],
     *,
-    calibration_sha256: str,
+    evidence_sha256: str,
+    comparison_mode: str,
     trial_role: str,
 ) -> list[str]:
     values = {
@@ -990,7 +1505,21 @@ def _labels(
         "execution_order": str(item["execution_order"]),
         "interval_ms": str(plan["acquisition"]["interval_ms"]),
         "poll_interval_ms": str(plan["acquisition"]["poll_interval_ms"]),
-        "measurement_overhead_calibration_sha256": calibration_sha256,
+        "post_exit_capture_ms": str(
+            plan["acquisition"].get("post_exit_capture_ms", 0)
+        ),
+        "comparison_mode": comparison_mode,
+        "measurement_evidence_sha256": evidence_sha256,
+        "measurement_overhead_calibration_sha256": (
+            evidence_sha256
+            if comparison_mode == ABSOLUTE_EXPLORATORY_MODE
+            else "none"
+        ),
+        "differential_readiness_sha256": (
+            evidence_sha256
+            if comparison_mode == PAIRED_DIFFERENTIAL_MODE
+            else "none"
+        ),
     }
     result: list[str] = []
     for key, value in sorted(values.items()):
@@ -1187,8 +1716,17 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
     )
     runtime_guard()
     readiness = preflight(plan, socket=args.socket, calibration_path=args.calibration)
-    if readiness["descriptive_comparison_ready"] is not True:
-        raise ValueError("physical study requires an eligible exploratory calibration")
+    comparison_mode = str(readiness["comparison_mode"])
+    if comparison_mode == ABSOLUTE_EXPLORATORY_MODE:
+        if readiness["descriptive_comparison_ready"] is not True:
+            raise ValueError(
+                "absolute physical study requires an eligible exploratory calibration"
+            )
+    elif (
+        comparison_mode != PAIRED_DIFFERENTIAL_MODE
+        or readiness["differential_comparison_ready"] is not True
+    ):
+        raise ValueError("paired physical study requires sealed differential readiness")
     output_root = args.out.resolve()
     output_root.mkdir(parents=True, exist_ok=False)
     write_new(
@@ -1206,8 +1744,36 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
     expected = _expected_stdout(plan)
     source = readiness["selected_source"]
     calibration = readiness["calibration"]
-    overhead = float(calibration["document"]["selected_metrics"]["measurement_overhead_ratio"])
-    calibration_thresholds = calibration["document"]["thresholds"]
+    differential_readiness = readiness["differential_readiness"]
+    evidence = calibration or differential_readiness
+    if not isinstance(evidence, dict):
+        raise ValueError("measurement evidence disappeared after preflight")
+    if calibration is not None:
+        overhead: float | None = float(
+            calibration["document"]["selected_metrics"][
+                "measurement_overhead_ratio"
+            ]
+        )
+        max_overhead_ratio = float(
+            calibration["document"]["thresholds"][
+                "max_measurement_overhead_ratio"
+            ]
+        )
+        max_missing_sample_ratio = float(
+            calibration["document"]["thresholds"]["max_missing_sample_ratio"]
+        )
+    else:
+        overhead = None
+        max_overhead_ratio = 0.01
+        max_missing_sample_ratio = float(
+            plan["analysis"]["max_missing_sample_ratio"]
+        )
+    try:
+        target_nice = os.getpriority(os.PRIO_PROCESS, 0)
+    except (AttributeError, OSError) as error:
+        raise ValueError(f"cannot establish inherited target priority: {error}") from error
+    if isinstance(target_nice, bool) or not isinstance(target_nice, int):
+        raise ValueError("inherited target priority is invalid")
     summaries: list[dict[str, object]] = []
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1237,13 +1803,16 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
             str(plan["acquisition"]["poll_interval_ms"]),
             "--timeout-ms",
             str(plan["workload"]["target_timeout_ms"]),
+            "--post-exit-capture-ms",
+            str(plan["acquisition"].get("post_exit_capture_ms", 0)),
             "--run-id",
             item["run_id"],
             *_labels(
                 plan,
                 item,
                 condition,
-                calibration_sha256=calibration["sha256"],
+                evidence_sha256=evidence["sha256"],
+                comparison_mode=comparison_mode,
                 trial_role=(
                     "qualification-pilot" if is_pilot else "comparison-matrix"
                 ),
@@ -1322,6 +1891,14 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
             marker_duration_s = (end_ns - start_ns) / 1e9
             if marker_duration_s < plan["acquisition"]["minimum_target_duration_s"]:
                 blockers.append("TARGET_WINDOW_TOO_SHORT")
+            if (
+                comparison_mode == PAIRED_DIFFERENTIAL_MODE
+                and marker_duration_s
+                > float(
+                    plan["analysis"]["maximum_calibrated_marker_duration_s"]
+                )
+            ):
+                blockers.append("TARGET_WINDOW_EXCEEDS_AA_CALIBRATION")
         except (OSError, ValueError, SystemExit) as error:
             marker_duration_s = None
             blockers.append(f"MARKER_WINDOW_INVALID:{error}")
@@ -1331,15 +1908,22 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
                 run_id=item["run_id"],
                 source_uid=source["source_uid"],
                 measurement_overhead_ratio=overhead,
-                max_overhead_ratio=float(
-                    calibration_thresholds["max_measurement_overhead_ratio"]
-                ),
-                max_missing_sample_ratio=float(
-                    calibration_thresholds["max_missing_sample_ratio"]
-                ),
+                max_overhead_ratio=max_overhead_ratio,
+                max_missing_sample_ratio=max_missing_sample_ratio,
             )
-            if quality["disposition"] != "ACCEPTED":
+            quality_eligible = (
+                quality["disposition"] == "ACCEPTED"
+                if comparison_mode == ABSOLUTE_EXPLORATORY_MODE
+                else differential_quality_eligible(quality)
+            )
+            if not quality_eligible:
                 blockers.append("QUALITY_NOT_ACCEPTED")
+        descriptive_eligible = (
+            comparison_mode == ABSOLUTE_EXPLORATORY_MODE and not blockers
+        )
+        differential_eligible = (
+            comparison_mode == PAIRED_DIFFERENTIAL_MODE and not blockers
+        )
         record = {
             "schema_version": SCHEMA_VERSION,
             "record_type": "wattch-agent-trial",
@@ -1388,9 +1972,30 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
             },
             "correctness": judgement,
             "quality": quality,
-            "calibration_bound": True,
-            "calibration": {key: calibration[key] for key in ("path", "sha256")},
-            "descriptive_local_run_eligible": not blockers,
+            "target_nice": target_nice,
+            "matched_execution_fingerprint": matched_execution_fingerprint(
+                plan,
+                block=int(item["block"]),
+                target_nice=target_nice,
+            ),
+            "comparison_mode": comparison_mode,
+            "calibration_bound": calibration is not None,
+            "calibration": (
+                {key: calibration[key] for key in ("path", "sha256")}
+                if calibration is not None
+                else None
+            ),
+            "differential_readiness_bound": differential_readiness is not None,
+            "differential_readiness": (
+                {
+                    key: differential_readiness[key]
+                    for key in ("path", "sha256", "instrumented_sha256")
+                }
+                if differential_readiness is not None
+                else None
+            ),
+            "descriptive_local_run_eligible": descriptive_eligible,
+            "differential_local_run_eligible": differential_eligible,
             "physical_claim_eligible": False,
             "run_blockers": blockers,
         }
@@ -1438,10 +2043,14 @@ def run_study(args: argparse.Namespace) -> dict[str, object]:
         )
         write_new(summary_path, summary_value)
         if is_pilot:
-            pilot_eligible = (
-                record["descriptive_local_run_eligible"] is True
-                and summary_value.get("descriptive_local_run_eligible") is True
+            eligibility_field = (
+                "descriptive_local_run_eligible"
+                if comparison_mode == ABSOLUTE_EXPLORATORY_MODE
+                else "differential_local_run_eligible"
             )
+            pilot_eligible = record[eligibility_field] is True and summary_value.get(
+                eligibility_field
+            ) is True
             write_new(
                 output_root / "pilot" / "RESULT.json",
                 {
@@ -1481,6 +2090,19 @@ def bootstrap_mean_ci(values: list[float], *, seed: int, samples: int = 10_000) 
 def aggregate_study(
     plan: dict[str, Any], *, readiness: dict[str, Any], trials: list[dict[str, Any]]
 ) -> dict[str, object]:
+    comparison_mode = str(
+        readiness.get("comparison_mode", ABSOLUTE_EXPLORATORY_MODE)
+    )
+    eligibility_field = (
+        "differential_local_run_eligible"
+        if comparison_mode == PAIRED_DIFFERENTIAL_MODE
+        else "descriptive_local_run_eligible"
+    )
+    readiness_field = (
+        "differential_comparison_ready"
+        if comparison_mode == PAIRED_DIFFERENTIAL_MODE
+        else "descriptive_comparison_ready"
+    )
     by_condition: dict[str, list[dict[str, Any]]] = {name: [] for name in CANONICAL_CONDITIONS}
     by_block: dict[int, dict[str, float]] = {}
     expected_schedule = plan["design"].get("schedule")
@@ -1506,7 +2128,7 @@ def aggregate_study(
         and len(expected_rows) > 0
         and Counter(expected_rows) == Counter(observed_rows)
         and all(count == 1 for count in Counter(observed_rows).values())
-        and readiness.get("descriptive_comparison_ready") is True
+        and readiness.get(readiness_field) is True
     )
     all_eligible = matrix_complete
     for item in trials:
@@ -1514,8 +2136,8 @@ def aggregate_study(
         summary = item["summary"]
         record = item["record"]
         eligible = (
-            record["descriptive_local_run_eligible"] is True
-            and summary.get("descriptive_local_run_eligible") is True
+            record.get(eligibility_field) is True
+            and summary.get(eligibility_field) is True
         )
         all_eligible = all_eligible and eligible
         energy = summary.get("outcome", {}).get("total_joules") if eligible else None
@@ -1524,7 +2146,12 @@ def aggregate_study(
             "block": item["schedule"]["block"],
             "execution_order": item["schedule"]["execution_order"],
             "run_id": item["schedule"]["run_id"],
-            "descriptive_local_run_eligible": eligible,
+            "descriptive_local_run_eligible": (
+                eligible if comparison_mode == ABSOLUTE_EXPLORATORY_MODE else False
+            ),
+            "differential_local_run_eligible": (
+                eligible if comparison_mode == PAIRED_DIFFERENTIAL_MODE else False
+            ),
             "energy_joules": energy,
             "duration_s": duration,
             "blockers": record["run_blockers"],
@@ -1553,18 +2180,48 @@ def aggregate_study(
         "skill_terra_minus_luna": ("terra-skill", "luna-skill"),
     }
     contrasts: dict[str, object] = {}
+    base_threshold = (
+        float(plan.get("analysis", {}).get("meaningful_effect_joules"))
+        if comparison_mode == PAIRED_DIFFERENTIAL_MODE
+        else None
+    )
     for index, (name, (left, right)) in enumerate(contrast_specs.items()):
         values = [
             block[left] - block[right]
             for block in by_block.values()
             if left in block and right in block
         ]
+        mean = statistics.fmean(values) if values else None
+        interval = bootstrap_mean_ci(
+            values, seed=int(plan["design"]["schedule_seed"]) + index
+        )
+        interval_excludes_zero = (
+            interval is not None and (interval[0] > 0 or interval[1] < 0)
+        )
+        directional = (
+            comparison_mode == PAIRED_DIFFERENTIAL_MODE
+            and all_eligible
+            and mean is not None
+            and base_threshold is not None
+            and abs(mean) > base_threshold
+            and interval_excludes_zero
+        )
         contrasts[name] = {
+            "left_condition": left,
+            "right_condition": right,
             "paired_differences_joules": values,
-            "mean_difference_joules": statistics.fmean(values) if values else None,
+            "mean_difference_joules": mean,
             "median_difference_joules": statistics.median(values) if values else None,
-            "bootstrap_95_ci_mean_joules": bootstrap_mean_ci(
-                values, seed=int(plan["design"]["schedule_seed"]) + index
+            "bootstrap_95_ci_mean_joules": interval,
+            "meaningful_effect_floor_joules": base_threshold,
+            "interval_excludes_zero": interval_excludes_zero,
+            "directional_difference_detected": directional,
+            "detected_direction": (
+                f"{left}_higher_than_{right}"
+                if directional and mean > 0
+                else f"{left}_lower_than_{right}"
+                if directional
+                else None
             ),
         }
     interaction = []
@@ -1574,26 +2231,65 @@ def aggregate_study(
                 (block["terra-skill"] - block["terra-control"])
                 - (block["luna-skill"] - block["luna-control"])
             )
+    interaction_mean = statistics.fmean(interaction) if interaction else None
+    interaction_interval = bootstrap_mean_ci(
+        interaction, seed=int(plan["design"]["schedule_seed"]) + 99
+    )
+    interaction_threshold = (
+        base_threshold
+        * float(
+            plan.get("analysis", {}).get("interaction_threshold_multiplier", 2.0)
+        )
+        if base_threshold is not None
+        else None
+    )
+    interaction_interval_excludes_zero = interaction_interval is not None and (
+        interaction_interval[0] > 0 or interaction_interval[1] < 0
+    )
     contrasts["model_by_skill_interaction"] = {
         "paired_differences_joules": interaction,
-        "mean_difference_joules": statistics.fmean(interaction) if interaction else None,
+        "mean_difference_joules": interaction_mean,
         "median_difference_joules": statistics.median(interaction) if interaction else None,
-        "bootstrap_95_ci_mean_joules": bootstrap_mean_ci(
-            interaction, seed=int(plan["design"]["schedule_seed"]) + 99
+        "bootstrap_95_ci_mean_joules": interaction_interval,
+        "meaningful_effect_floor_joules": interaction_threshold,
+        "interval_excludes_zero": interaction_interval_excludes_zero,
+        "directional_difference_detected": (
+            comparison_mode == PAIRED_DIFFERENTIAL_MODE
+            and all_eligible
+            and interaction_mean is not None
+            and interaction_threshold is not None
+            and abs(interaction_mean) > interaction_threshold
+            and interaction_interval_excludes_zero
         ),
     }
+    differential_evaluable = (
+        comparison_mode == PAIRED_DIFFERENTIAL_MODE and all_eligible
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "record_type": RESULT_KIND,
         "plan_id": plan["plan_id"],
+        "comparison_mode": comparison_mode,
         "source": readiness["selected_source"],
         "cells": cells,
         "paired_contrasts": contrasts,
         "claims": {
-            "descriptive_local_comparison_eligible": all_eligible,
+            "descriptive_local_comparison_eligible": (
+                all_eligible if comparison_mode == ABSOLUTE_EXPLORATORY_MODE else False
+            ),
+            "exploratory_paired_differential_comparison_eligible": (
+                differential_evaluable
+            ),
+            "directional_implementation_findings": {
+                name: bool(value.get("directional_difference_detected"))
+                for name, value in contrasts.items()
+                if isinstance(value, dict)
+            },
             "physical_comparison_claim_eligible": False,
             "confirmatory_comparison_claim_eligible": False,
             "local_generated_code_source_domain_only": True,
+            "model_population_effect_claim_eligible": False,
+            "skill_population_effect_claim_eligible": False,
             "remote_model_energy_claim_eligible": False,
             "whole_machine_energy_claim_eligible": False,
         },
@@ -1629,9 +2325,23 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument(
         "--poll-interval-ms", type=int, default=DEFAULT_POLL_INTERVAL_MS
     )
+    prepare.add_argument(
+        "--post-exit-capture-ms",
+        type=int,
+        default=0,
+        help="retain telemetry after TARGET_EXIT without extending the outcome window",
+    )
     prepare.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     prepare.add_argument("--minimum-target-duration-s", type=float, default=DEFAULT_MIN_DURATION_S)
     prepare.add_argument("--minimum-samples", type=int, default=DEFAULT_MIN_SAMPLES)
+    prepare.add_argument(
+        "--differential-readiness",
+        type=Path,
+        help=(
+            "bind a rejected absolute meter plus its sealed A/A floor for a "
+            "separate exploratory paired-difference study"
+        ),
+    )
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--plan", type=Path, required=True)
@@ -1644,7 +2354,11 @@ def parse_args() -> argparse.Namespace:
     run = subparsers.add_parser("run")
     run.add_argument("--plan", type=Path, required=True)
     run.add_argument("--socket", type=Path, required=True)
-    run.add_argument("--calibration", type=Path, required=True)
+    run.add_argument(
+        "--calibration",
+        type=Path,
+        help="required only for ABSOLUTE_EXPLORATORY plans",
+    )
     run.add_argument("--wattch", type=Path, required=True)
     run.add_argument("--out", type=Path, required=True)
     return parser.parse_args()
@@ -1668,6 +2382,8 @@ def main() -> None:
             raise ValueError("accounts must not exceed events")
         if args.cooldown_s < 0 or args.minimum_target_duration_s <= 0:
             raise ValueError("cooldown and duration bounds are invalid")
+        if not 0 <= args.post_exit_capture_ms <= 60_000:
+            raise ValueError("post-exit capture must be between 0 and 60000 ms")
         minimum_native_window_s = args.interval_ms * 10 / 1000
         if args.minimum_samples < 10:
             raise ValueError("minimum samples must cover at least ten native updates")
