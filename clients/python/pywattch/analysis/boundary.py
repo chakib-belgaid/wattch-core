@@ -28,6 +28,13 @@ INTERVAL_TIMELINE_RECONSTRUCTION_LABEL = (
 INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1 = (
     "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1"
 )
+INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2 = (
+    "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+)
+SUPPORTED_INTERVAL_RECONSTRUCTIONS = {
+    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2,
+}
 
 
 class AnalysisError(WattchError):
@@ -75,7 +82,7 @@ def _validate_interval_average_descriptor(
     reconstruction = source.labels.get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
     if (
         reconstruction is not None
-        and reconstruction != INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1
+        and reconstruction not in SUPPORTED_INTERVAL_RECONSTRUCTIONS
     ):
         raise BoundaryMismatchError(
             f"INTERVAL_AVERAGE source {source.source_uid!r} declares unsupported "
@@ -127,6 +134,7 @@ class BoundarySourceSignature:
     disjoint_group: str | None = None
     disjoint_member: str | None = None
     interval_duration_source_uid: str | None = None
+    interval_timeline_reconstruction: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -160,14 +168,27 @@ class BoundarySourceSignature:
                 self.interval_duration_source_uid,
                 "interval_duration_source_uid",
             )
-        elif self.interval_duration_source_uid is not None:
+            if self.interval_timeline_reconstruction not in {
+                None,
+                INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2,
+            }:
+                raise AnalysisError(
+                    "an INTERVAL_AVERAGE source signature must omit the "
+                    "legacy v1 reconstruction or freeze v2 explicitly"
+                )
+        elif (
+            self.interval_duration_source_uid is not None
+            or self.interval_timeline_reconstruction is not None
+        ):
             raise AnalysisError(
-                "only INTERVAL_AVERAGE sources may declare an "
-                "interval_duration_source_uid"
+                "only INTERVAL_AVERAGE sources may declare interval linkage"
             )
 
     @classmethod
     def from_descriptor(cls, source: SourceDescriptor) -> "BoundarySourceSignature":
+        reconstruction = source.labels.get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
+        if reconstruction == INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1:
+            reconstruction = None
         return cls(
             source_uid=source.source_uid,
             kind=source.kind,
@@ -181,6 +202,7 @@ class BoundarySourceSignature:
             interval_duration_source_uid=source.labels.get(
                 INTERVAL_DURATION_SOURCE_UID_LABEL
             ),
+            interval_timeline_reconstruction=reconstruction,
         )
 
     @classmethod
@@ -204,6 +226,15 @@ class BoundarySourceSignature:
                 raise AnalysisError(
                     "interval_duration_source_uid must be a string or null"
                 )
+            interval_timeline_reconstruction = data.get(
+                "interval_timeline_reconstruction"
+            )
+            if interval_timeline_reconstruction is not None and not isinstance(
+                interval_timeline_reconstruction, str
+            ):
+                raise AnalysisError(
+                    "interval_timeline_reconstruction must be a string or null"
+                )
             return cls(
                 source_uid=_text(data["source_uid"], "source_uid"),
                 kind=_text(data["kind"], "kind"),
@@ -215,6 +246,9 @@ class BoundarySourceSignature:
                 disjoint_group=disjoint_group,
                 disjoint_member=disjoint_member,
                 interval_duration_source_uid=interval_duration_source_uid,
+                interval_timeline_reconstruction=(
+                    interval_timeline_reconstruction
+                ),
             )
         except KeyError as exc:
             raise AnalysisError(
@@ -236,6 +270,10 @@ class BoundarySourceSignature:
         if self.interval_duration_source_uid is not None:
             document["interval_duration_source_uid"] = (
                 self.interval_duration_source_uid
+            )
+        if self.interval_timeline_reconstruction is not None:
+            document["interval_timeline_reconstruction"] = (
+                self.interval_timeline_reconstruction
             )
         return document
 

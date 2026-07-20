@@ -37,7 +37,17 @@ MAX_AFFINE_DRIFT_PPM = 20_000.0
 MAX_RESIDUAL_FRACTION = 0.05
 MIN_MAX_RESIDUAL_NS = 2_000_000.0
 MAX_MAX_RESIDUAL_NS = 50_000_000.0
-AFFINE_RECONSTRUCTION_METHOD = "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1"
+AFFINE_RECONSTRUCTION_METHOD_V1 = "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1"
+AFFINE_RECONSTRUCTION_METHOD_V2 = "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2"
+
+# V2 preserves V1's five-percent ordinary residual envelope but recognizes
+# that long-lived pipe readers can have a very small number of scheduler-late
+# receipt anchors. At most two percent may exceed the ordinary envelope. The
+# hard envelope is the greater of that ordinary envelope and twenty percent of
+# a native interval, capped at 50 ms. Native elapsed durations remain the
+# timeline evidence; no raw timestamp is altered.
+MAX_RESIDUAL_OUTLIER_FRACTION_V2 = 0.02
+HARD_MAX_RESIDUAL_FRACTION_V2 = 0.20
 
 
 @dataclass(frozen=True)
@@ -60,8 +70,11 @@ class IntervalSynchronization:
     intercept_ns: float
     max_abs_residual_ns: float
     allowed_max_residual_ns: float
+    hard_max_residual_ns: float
+    residual_outlier_count: int
+    allowed_residual_outlier_count: int
     drift_ppm: float
-    method: str = AFFINE_RECONSTRUCTION_METHOD
+    method: str = AFFINE_RECONSTRUCTION_METHOD_V1
 
 
 def _positive_integer_duration(raw: float) -> int:
@@ -75,6 +88,8 @@ def _positive_integer_duration(raw: float) -> int:
 def synchronize_interval_averages(
     power_points: Sequence[tuple[int, float]],
     duration_points: Sequence[tuple[int, float]],
+    *,
+    method: str = AFFINE_RECONSTRUCTION_METHOD_V1,
 ) -> IntervalSynchronization:
     """Map contiguous native intervals to daemon receipt time.
 
@@ -85,6 +100,13 @@ def synchronize_interval_averages(
     historical unit-slope interpretation and ends exactly at its receipt.
     """
 
+    if method not in {
+        AFFINE_RECONSTRUCTION_METHOD_V1,
+        AFFINE_RECONSTRUCTION_METHOD_V2,
+    }:
+        raise AnalysisError(
+            f"unsupported interval-average reconstruction method {method!r}"
+        )
     if not power_points:
         raise AnalysisError("interval-average synchronization needs at least one frame")
     power_receipts = tuple(timestamp for timestamp, _ in power_points)
@@ -146,10 +168,27 @@ def synchronize_interval_averages(
         max(MIN_MAX_RESIDUAL_NS, median_duration * MAX_RESIDUAL_FRACTION),
     )
     max_abs_residual = max(abs(value) for value in residuals)
-    if max_abs_residual > allowed_residual:
+    residual_outliers = sum(abs(value) > allowed_residual for value in residuals)
+    if method == AFFINE_RECONSTRUCTION_METHOD_V1:
+        allowed_residual_outliers = 0
+        hard_max_residual = allowed_residual
+    else:
+        allowed_residual_outliers = math.floor(
+            len(residuals) * MAX_RESIDUAL_OUTLIER_FRACTION_V2
+        )
+        hard_max_residual = min(
+            MAX_MAX_RESIDUAL_NS,
+            max(allowed_residual, median_duration * HARD_MAX_RESIDUAL_FRACTION_V2),
+        )
+    if (
+        residual_outliers > allowed_residual_outliers
+        or max_abs_residual > hard_max_residual
+    ):
         raise AnalysisError(
-            "interval-average affine synchronization receipt residual "
-            f"{max_abs_residual:.0f} ns exceeds {allowed_residual:.0f} ns"
+            "interval-average affine synchronization receipt residuals are "
+            f"ineligible for {method}: {residual_outliers} ordinary-envelope "
+            f"outlier(s), limit {allowed_residual_outliers}; maximum "
+            f"{max_abs_residual:.0f} ns, hard limit {hard_max_residual:.0f} ns"
         )
 
     # Round each shared native boundary once. Adjacent intervals reuse the same
@@ -182,5 +221,9 @@ def synchronize_interval_averages(
         intercept_ns=intercept,
         max_abs_residual_ns=max_abs_residual,
         allowed_max_residual_ns=allowed_residual,
+        hard_max_residual_ns=hard_max_residual,
+        residual_outlier_count=residual_outliers,
+        allowed_residual_outlier_count=allowed_residual_outliers,
         drift_ppm=drift_ppm,
+        method=method,
     )

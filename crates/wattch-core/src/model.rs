@@ -104,6 +104,11 @@ pub const INTERVAL_TIMELINE_RECONSTRUCTION_LABEL: &str = "wattch.interval_timeli
 pub const INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1: &str =
     "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1";
 
+/// Wattch v2 reconstruction: the same affine native timeline as v1, with an
+/// explicit bounded allowance for rare scheduler-late receipt anchors.
+pub const INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2: &str =
+    "AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2";
+
 /// Metadata sent once per source. Samples refer to `local_source_id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceDescriptor {

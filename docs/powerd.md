@@ -58,15 +58,19 @@ native Apple hardware-acquisition timestamp. Each power descriptor is
 `wattch.interval_duration_source_uid` to the same-frame raw
 `SAMPLE_INTERVAL_DURATION` source. Its raw sample timestamp is the receipt
 anchor used as synchronization evidence, and its descriptor declares
-`wattch.interval_timeline_reconstruction=AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1`.
+`wattch.interval_timeline_reconstruction=AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2`.
 Offline analysis reconstructs a contiguous timeline from cumulative native
 `elapsed_ns` values, then fits one affine synchronization against all daemon
-receipt anchors. It rejects excessive clock-scale drift or receipt residuals
-before multiplying each average by only the exact mapped overlap with
-daemon-stamped event windows. It never treats the values as instantaneous
-points, applies trapezoidal interpolation, silently fills a missing native
-frame, or double counts receipt jitter. Interval calibration must still account
-for pipe delivery and tool scheduling delay and jitter.
+receipt anchors. V2 keeps V1's drift and ordinary-residual checks, permits no
+more than two percent rare scheduler-late anchors beyond the ordinary envelope.
+Its hard envelope is the greater of that ordinary envelope and twenty percent
+of the median native interval, capped at 50 ms. Existing V1 descriptors retain their
+stricter zero-outlier interpretation. Analysis applies this policy before
+multiplying each average by only the exact mapped overlap with daemon-stamped
+event windows. It never treats the values as instantaneous points, changes raw
+receipt timestamps, applies trapezoidal interpolation, silently fills a missing
+native frame, or double counts receipt jitter. Interval calibration must still
+account for pipe delivery and tool scheduling delay and jitter.
 
 The plist parser and collector lifecycle are covered by deterministic tests.
 Availability and semantics of live Apple domains still depend on the host and

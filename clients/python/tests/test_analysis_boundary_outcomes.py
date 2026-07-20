@@ -9,6 +9,11 @@ from pywattch.analysis import (
     MeasurementBoundary,
     compute_energy_outcome,
 )
+from pywattch.analysis._intervals import (
+    AFFINE_RECONSTRUCTION_METHOD_V1,
+    AFFINE_RECONSTRUCTION_METHOD_V2,
+    synchronize_interval_averages,
+)
 
 
 def descriptor(
@@ -54,7 +59,9 @@ def samples(source_id: int, values: list[float]) -> list[RawSample]:
     ]
 
 
-def interval_average_descriptors() -> tuple[SourceDescriptor, SourceDescriptor]:
+def interval_average_descriptors(
+    reconstruction: str | None = None,
+) -> tuple[SourceDescriptor, SourceDescriptor]:
     duration_uid = "powermetrics://node-a/frame/elapsed_ns"
     power = descriptor(
         7,
@@ -68,6 +75,11 @@ def interval_average_descriptors() -> tuple[SourceDescriptor, SourceDescriptor]:
         labels={
             "wattch.interval_duration_source_uid": duration_uid,
             "wattch.interval_anchor": "ENDS_AT_DAEMON_RECEIPT_TIMESTAMP",
+            **(
+                {"wattch.interval_timeline_reconstruction": reconstruction}
+                if reconstruction is not None
+                else {}
+            ),
         },
     )
     duration = descriptor(
@@ -312,6 +324,71 @@ def test_interval_average_affine_sync_rejects_excessive_receipt_residual():
             end_monotonic_ns=4_000_000_000,
             estimand="FIXED_HORIZON",
         )
+
+
+def test_interval_average_v2_bounds_rare_receipt_scheduler_outliers():
+    interval_ns = 250_000_000
+    receipts = [1_000_000_000 + index * interval_ns for index in range(120)]
+    receipts[0] += 20_000_000
+    receipts[-1] -= 20_000_000
+    power = [(receipt, 10_000.0) for receipt in receipts]
+    duration = [(receipt, float(interval_ns)) for receipt in receipts]
+
+    with pytest.raises(AnalysisError, match="receipt residual"):
+        synchronize_interval_averages(
+            power,
+            duration,
+            method=AFFINE_RECONSTRUCTION_METHOD_V1,
+        )
+
+    result = synchronize_interval_averages(
+        power,
+        duration,
+        method=AFFINE_RECONSTRUCTION_METHOD_V2,
+    )
+    assert result.method == AFFINE_RECONSTRUCTION_METHOD_V2
+    assert result.residual_outlier_count == 2
+    assert result.allowed_residual_outlier_count == 2
+    assert result.max_abs_residual_ns < result.hard_max_residual_ns
+
+    receipts[60] += 20_000_000
+    power = [(receipt, 10_000.0) for receipt in receipts]
+    duration = [(receipt, float(interval_ns)) for receipt in receipts]
+    with pytest.raises(AnalysisError, match="outlier"):
+        synchronize_interval_averages(
+            power,
+            duration,
+            method=AFFINE_RECONSTRUCTION_METHOD_V2,
+        )
+
+
+def test_interval_average_v2_is_frozen_in_the_measurement_boundary():
+    v2_power, duration = interval_average_descriptors(
+        AFFINE_RECONSTRUCTION_METHOD_V2
+    )
+    boundary = MeasurementBoundary.from_descriptors(
+        [v2_power, duration],
+        [v2_power.source_uid],
+        boundary_id="powermetrics-v2",
+    )
+    signature = boundary.to_dict()["required_sources"][0]
+    assert (
+        signature["interval_timeline_reconstruction"]
+        == AFFINE_RECONSTRUCTION_METHOD_V2
+    )
+
+    explicit_v1 = boundary.to_dict()
+    explicit_v1["required_sources"][0]["interval_timeline_reconstruction"] = (
+        AFFINE_RECONSTRUCTION_METHOD_V1
+    )
+    with pytest.raises(AnalysisError, match="omit the legacy v1"):
+        MeasurementBoundary.from_dict(explicit_v1)
+
+    v1_power, v1_duration = interval_average_descriptors(
+        AFFINE_RECONSTRUCTION_METHOD_V1
+    )
+    with pytest.raises(BoundaryMismatchError, match="semantics"):
+        boundary.validate_descriptors([v1_power, v1_duration])
 
 
 def test_interval_average_clips_partial_native_intervals_at_event_edges():

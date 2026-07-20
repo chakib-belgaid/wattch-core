@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
 use crate::model::{
     EvidenceClass, RawSampleBatch, SourceDescriptor, SourceKind, Temporality, Unit,
-    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1, INTERVAL_ANCHOR_LABEL,
-    INTERVAL_DURATION_SOURCE_UID_LABEL, INTERVAL_ENDS_AT_DAEMON_RECEIPT_TIMESTAMP,
-    INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
+    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1, INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2,
+    INTERVAL_ANCHOR_LABEL, INTERVAL_DURATION_SOURCE_UID_LABEL,
+    INTERVAL_ENDS_AT_DAEMON_RECEIPT_TIMESTAMP, INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
 };
 use crate::research::{
     AcceptedControlTrialProvenance, AcceptedTargetTrialProvenance, AggregationRule,
@@ -63,7 +63,11 @@ pub fn validate_source_descriptor(desc: &SourceDescriptor) -> Result<()> {
             .get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
             .map(String::as_str)
         {
-            if reconstruction != INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1 {
+            if !matches!(
+                reconstruction,
+                INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1
+                    | INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2
+            ) {
                 return Err(Error::InvalidSourceDescriptor {
                     source_uid: desc.source_uid.clone(),
                     reason: format!(
@@ -467,21 +471,26 @@ fn validate_boundary_signature(
     match (
         &signature.temporality,
         &signature.interval_duration_source_uid,
+        &signature.interval_timeline_reconstruction,
     ) {
-        (Temporality::IntervalAverage, Some(duration_uid)) if !duration_uid.trim().is_empty() => {}
-        (Temporality::IntervalAverage, _) => {
+        (Temporality::IntervalAverage, Some(duration_uid), reconstruction)
+            if !duration_uid.trim().is_empty()
+                && reconstruction.as_deref().map_or(true, |value| {
+                    value == INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2
+                }) => {}
+        (Temporality::IntervalAverage, _, _) => {
             return Err(invalid(format!(
-                "required interval-average source {:?} must freeze its duration source uid",
+                "required interval-average source {:?} must freeze valid duration and reconstruction semantics",
                 signature.source_uid
             )));
         }
-        (_, Some(_)) => {
+        (_, Some(_), _) | (_, _, Some(_)) => {
             return Err(invalid(format!(
-                "non-interval source {:?} cannot declare an interval duration source",
+                "non-interval source {:?} cannot declare interval linkage",
                 signature.source_uid
             )));
         }
-        (_, None) => {}
+        (_, None, None) => {}
     }
     Ok(())
 }
@@ -534,6 +543,18 @@ fn validate_boundary_signature_match(
             .map(String::as_str)
     {
         return Err(mismatch("interval duration source uid"));
+    }
+    let signature_reconstruction = signature
+        .interval_timeline_reconstruction
+        .as_deref()
+        .unwrap_or(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1);
+    let source_reconstruction = source
+        .labels
+        .get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
+        .map(String::as_str)
+        .unwrap_or(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1);
+    if signature_reconstruction != source_reconstruction {
+        return Err(mismatch("interval timeline reconstruction"));
     }
     Ok(())
 }
@@ -2018,6 +2039,72 @@ mod tests {
         assert!(error
             .to_string()
             .contains("SAMPLE_INTERVAL_DURATION must use NANOSECOND and DELTA"));
+    }
+
+    #[test]
+    fn interval_reconstruction_v2_is_frozen_and_cannot_match_v1() {
+        let duration_uid = "powermetrics://node-0/frame/elapsed_ns";
+        let mut v2_power = source(
+            1,
+            "powermetrics://node-0/cpu/power",
+            SourceKind::CpuPower,
+            Unit::Milliwatt,
+            Temporality::IntervalAverage,
+            EvidenceClass::ToolDerivedEstimate,
+            None,
+        );
+        v2_power.labels.insert(
+            INTERVAL_DURATION_SOURCE_UID_LABEL.to_string(),
+            duration_uid.to_string(),
+        );
+        v2_power.labels.insert(
+            INTERVAL_ANCHOR_LABEL.to_string(),
+            INTERVAL_ENDS_AT_DAEMON_RECEIPT_TIMESTAMP.to_string(),
+        );
+        v2_power.labels.insert(
+            INTERVAL_TIMELINE_RECONSTRUCTION_LABEL.to_string(),
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2.to_string(),
+        );
+        let duration = source(
+            2,
+            duration_uid,
+            SourceKind::SampleIntervalDuration,
+            Unit::Nanosecond,
+            Temporality::Delta,
+            EvidenceClass::ToolDerivedEstimate,
+            None,
+        );
+        validate_source_set(&[v2_power.clone(), duration.clone()]).unwrap();
+
+        let boundary = single_boundary(&v2_power);
+        assert_eq!(
+            boundary.required_sources[0]
+                .interval_timeline_reconstruction
+                .as_deref(),
+            Some(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2)
+        );
+        validate_measurement_boundary(&boundary, &[v2_power.clone(), duration.clone()]).unwrap();
+
+        let mut explicit_v1_boundary = boundary.clone();
+        explicit_v1_boundary.required_sources[0].interval_timeline_reconstruction =
+            Some(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1.to_string());
+        assert!(matches!(
+            validate_measurement_boundary(
+                &explicit_v1_boundary,
+                &[v2_power.clone(), duration.clone()]
+            ),
+            Err(Error::InvalidMeasurementBoundary { .. })
+        ));
+
+        let mut v1_power = v2_power;
+        v1_power.labels.insert(
+            INTERVAL_TIMELINE_RECONSTRUCTION_LABEL.to_string(),
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1.to_string(),
+        );
+        assert!(matches!(
+            validate_measurement_boundary(&boundary, &[v1_power, duration]),
+            Err(Error::InvalidMeasurementBoundary { .. })
+        ));
     }
 
     fn single_boundary(source: &SourceDescriptor) -> MeasurementBoundary {

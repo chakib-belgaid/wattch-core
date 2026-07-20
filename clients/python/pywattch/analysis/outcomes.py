@@ -10,7 +10,9 @@ from typing import Iterable
 from .._messages import RawSample, SourceDescriptor
 from ..meter import cumulative_delta
 from .boundary import (
+    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
     INTERVAL_DURATION_SOURCE_UID_LABEL,
+    INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
     AnalysisError,
     MeasurementBoundary,
 )
@@ -216,7 +218,14 @@ def _interval_average_power_joules(
             f"interval-average source {descriptor.source_uid!r} uses unsupported "
             f"power unit {descriptor.unit!r}"
         )
-    synchronized = synchronize_interval_averages(power_points, duration_points)
+    synchronized = synchronize_interval_averages(
+        power_points,
+        duration_points,
+        method=descriptor.labels.get(
+            INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+        ),
+    )
 
     joules = 0.0
     covered_segments: list[tuple[int, int]] = []

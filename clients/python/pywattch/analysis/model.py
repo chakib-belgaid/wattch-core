@@ -22,7 +22,13 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..meter import cumulative_delta
 from ._intervals import synchronize_interval_averages
-from .boundary import AnalysisError, MeasurementBoundary, SemanticBoundaryRebind
+from .boundary import (
+    INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+    INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
+    AnalysisError,
+    MeasurementBoundary,
+    SemanticBoundaryRebind,
+)
 from .effects import StudyAcceptanceResult
 
 
@@ -359,7 +365,15 @@ def _derive_trial_model_power(
             if getattr(sample, "source_id", None)
             == duration_descriptor.local_source_id
         )
-        synchronized = synchronize_interval_averages(points, duration_points)
+        reconstruction = descriptor.labels.get(
+            INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
+            INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+        )
+        synchronized = synchronize_interval_averages(
+            points,
+            duration_points,
+            method=reconstruction,
+        )
         segments: list[tuple[int, int, float]] = []
         pre_values: list[float] = []
         for interval in synchronized.intervals:
@@ -379,7 +393,12 @@ def _derive_trial_model_power(
         timestamps = (start_ns, *(segment[1] for segment in segments))
         values = (segments[0][2], *(segment[2] for segment in segments))
         initial = pre_values[-1]
-        method = "RAW_INTERVAL_AVERAGE_AFFINE_SYNC_V1"
+        if reconstruction == INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1:
+            # Keep the established v1 artifact label stable. New
+            # reconstruction semantics receive their own explicit label.
+            method = "RAW_INTERVAL_AVERAGE_AFFINE_SYNC_V1"
+        else:
+            method = "RAW_INTERVAL_AVERAGE_AFFINE_SYNC_V2"
     else:
         raise AnalysisError(
             f"unsupported model source temporality {descriptor.temporality!r}"

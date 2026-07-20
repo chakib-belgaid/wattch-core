@@ -19,7 +19,7 @@ use thiserror::Error;
 use tracing::warn;
 use wattch_core::{
     validate_source_set, EvidenceClass, RawValue, SamplingMode, SourceDescriptor, SourceKind,
-    Temporality, Unit, INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1, INTERVAL_ANCHOR_LABEL,
+    Temporality, Unit, INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2, INTERVAL_ANCHOR_LABEL,
     INTERVAL_DURATION_SOURCE_UID_LABEL, INTERVAL_ENDS_AT_DAEMON_RECEIPT_TIMESTAMP,
     INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
 };
@@ -621,7 +621,7 @@ fn descriptors_for(
             );
             labels.insert(
                 INTERVAL_TIMELINE_RECONSTRUCTION_LABEL.to_string(),
-                INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1.to_string(),
+                INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2.to_string(),
             );
             SourceDescriptor {
                 local_source_id: domain.source_id(),
@@ -767,7 +767,7 @@ mod tests {
                     .labels
                     .get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
                     .map(String::as_str)
-                    == Some(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1)
+                    == Some(INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V2)
         }));
         assert_eq!(descriptors[0].kind, SourceKind::CpuPower);
         assert_eq!(descriptors[1].kind, SourceKind::GpuPower);

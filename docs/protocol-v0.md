@@ -346,14 +346,20 @@ same frame.
 sample timestamp is the daemon-clock receipt anchor for that native interval.
 Receipt delivery jitter means the native interval must not be reconstructed by
 independently subtracting every duration from every receipt. New
-`powermetrics` descriptors also carry
-`wattch.interval_timeline_reconstruction=AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V1`.
+`powermetrics` descriptors carry
+`wattch.interval_timeline_reconstruction=AFFINE_NATIVE_ELAPSED_TO_DAEMON_RECEIPTS_V2`.
 Offline consumers form one contiguous cumulative-native-duration timeline and
 fit one quality-checked affine mapping from its interval ends to all daemon
-receipt anchors. Excessive clock-scale drift or receipt residuals invalidate
-the outcome. Consumers integrate the constant interval average only over its
-mapped overlap with an event window; they must not fill gaps, double count, or
-trapezoidally interpolate it.
+receipt anchors. V2 preserves V1's two-percent clock-scale drift limit and
+ordinary receipt-residual envelope. For long traces, it additionally permits
+at most two percent of anchors outside that ordinary envelope. Its hard
+envelope is the greater of the ordinary envelope and twenty percent of the
+median native interval, capped at 50 ms. A trace exceeding either bound is
+invalid. V1 remains
+supported unchanged for existing descriptors and permits no such outliers.
+Consumers integrate the constant interval average only over its mapped overlap
+with an event window; they must not fill gaps, double count, alter raw receipt
+timestamps, or trapezoidally interpolate it.
 
 Existing traces whose descriptors say `INSTANT` retain their point-sample
 meaning and remain readable. The new temporality changes newly acquired

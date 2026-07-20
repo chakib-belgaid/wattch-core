@@ -5,7 +5,8 @@
 //! evaluation, or any other interpretation of raw telemetry.
 
 use crate::model::{
-    EvidenceClass, SourceKind, Temporality, Unit, INTERVAL_DURATION_SOURCE_UID_LABEL,
+    EvidenceClass, SourceKind, Temporality, Unit, INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1,
+    INTERVAL_DURATION_SOURCE_UID_LABEL, INTERVAL_TIMELINE_RECONSTRUCTION_LABEL,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -56,6 +57,12 @@ pub struct BoundarySourceSignature {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_duration_source_uid: Option<String>,
+
+    /// Reconstruction semantics beyond the legacy v1 default. Omitting this
+    /// field means v1 so existing boundary JSON remains byte-stable; v2 and
+    /// later methods must be frozen explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_timeline_reconstruction: Option<String>,
 }
 
 impl BoundarySourceSignature {
@@ -73,6 +80,11 @@ impl BoundarySourceSignature {
             interval_duration_source_uid: source
                 .labels
                 .get(INTERVAL_DURATION_SOURCE_UID_LABEL)
+                .cloned(),
+            interval_timeline_reconstruction: source
+                .labels
+                .get(INTERVAL_TIMELINE_RECONSTRUCTION_LABEL)
+                .filter(|value| value.as_str() != INTERVAL_AFFINE_NATIVE_TO_DAEMON_RECEIPTS_V1)
                 .cloned(),
         }
     }
