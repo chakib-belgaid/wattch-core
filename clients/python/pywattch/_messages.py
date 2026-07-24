@@ -1,15 +1,15 @@
-"""Typed protocol v0 messages (JSON payloads), mirroring messages.rs."""
+"""Typed protocol v0.1 messages (JSON payloads), mirroring messages.rs."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from ._frames import FrameKind
 from .errors import WattchProtocolError
 
-PROTOCOL_VERSION = "0.2.0"
+PROTOCOL_VERSION = "0.1.0"
 
 
 @dataclass(frozen=True)
@@ -151,98 +151,12 @@ class RawSampleBatch:
 
 
 @dataclass(frozen=True)
-class Event:
-    event_id: str
-    run_id: str
-    node_id: str
-    monotonic_ns: int
-    kind: str
-    labels: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Event":
-        return cls(
-            event_id=data["event_id"],
-            run_id=data["run_id"],
-            node_id=data["node_id"],
-            monotonic_ns=data["monotonic_ns"],
-            kind=data["kind"],
-            labels=dict(data.get("labels") or {}),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "event_id": self.event_id,
-            "run_id": self.run_id,
-            "node_id": self.node_id,
-            "monotonic_ns": self.monotonic_ns,
-            "kind": self.kind,
-            "labels": dict(self.labels),
-        }
-
-
-@dataclass(frozen=True)
-class EventBatch:
-    run_id: str
-    node_id: str
-    batch_sequence_no: int
-    events: tuple[Event, ...]
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EventBatch":
-        return cls(
-            run_id=data["run_id"],
-            node_id=data["node_id"],
-            batch_sequence_no=data["batch_sequence_no"],
-            events=tuple(Event.from_dict(event) for event in data["events"]),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "node_id": self.node_id,
-            "batch_sequence_no": self.batch_sequence_no,
-            "events": [event.to_dict() for event in self.events],
-        }
-
-
-@dataclass(frozen=True)
-class RecordEvent:
-    run_id: str
-    event_id: str
-    kind: str
-    labels: dict[str, str] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "event_id": self.event_id,
-            "kind": self.kind,
-            "labels": dict(self.labels),
-        }
-
-
-@dataclass(frozen=True)
-class RecordEventAck:
-    event: Event
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RecordEventAck":
-        return cls(event=Event.from_dict(data["event"]))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"event": self.event.to_dict()}
-
-
-@dataclass(frozen=True)
 class HelloResponse:
     daemon_name: str
     daemon_version: str
     protocol_version: str
     node_id: str
     sources: tuple[SourceDescriptor, ...]
-    # Empty only when decoding a legacy v0.1 response/artifact.
-    clock_instance_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -284,19 +198,6 @@ def encode_stop_capture(run_id: str) -> bytes:
     return json.dumps({"run_id": run_id}).encode()
 
 
-def encode_record_event(
-    run_id: str,
-    event_id: str,
-    kind: str,
-    labels: Mapping[str, str] | None = None,
-) -> bytes:
-    return json.dumps(
-        RecordEvent(run_id, event_id, kind, dict(labels or {})).to_dict(),
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-
-
 def decode_payload(kind: FrameKind, payload: bytes) -> Any:
     try:
         data = json.loads(payload)
@@ -311,7 +212,6 @@ def decode_payload(kind: FrameKind, payload: bytes) -> Any:
                 protocol_version=data["protocol_version"],
                 node_id=data["node_id"],
                 sources=tuple(SourceDescriptor.from_dict(s) for s in data["sources"]),
-                clock_instance_id=data.get("clock_instance_id", ""),
             )
         if kind == FrameKind.START_CAPTURE_ACK:
             return StartCaptureAck(
@@ -324,19 +224,8 @@ def decode_payload(kind: FrameKind, payload: bytes) -> Any:
                 batches_sent=data["batches_sent"],
                 samples_sent=data["samples_sent"],
             )
-        if kind == FrameKind.RECORD_EVENT:
-            return RecordEvent(
-                run_id=data["run_id"],
-                event_id=data["event_id"],
-                kind=data["kind"],
-                labels=dict(data.get("labels") or {}),
-            )
-        if kind == FrameKind.RECORD_EVENT_ACK:
-            return RecordEventAck.from_dict(data)
         if kind == FrameKind.RAW_SAMPLE_BATCH:
             return RawSampleBatch.from_dict(data)
-        if kind == FrameKind.EVENT_BATCH:
-            return EventBatch.from_dict(data)
         if kind == FrameKind.ERROR:
             return ErrorMessage(code=data["code"], message=data["message"])
     except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:

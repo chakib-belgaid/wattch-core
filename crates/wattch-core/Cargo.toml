@@ -11,6 +11,3 @@ description = "Domain primitives and validation for the wattch energy-measuremen
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

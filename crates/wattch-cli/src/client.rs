@@ -1,5 +1,4 @@
-use crate::artifact::EventStreamValidator;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::{self, Read};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -9,9 +8,8 @@ use thiserror::Error;
 use wattch_core::{validate_source_set, RawSampleBatch, RawStreamValidator, SourceDescriptor};
 use wattch_protocol::frame::WireError;
 use wattch_protocol::messages::{
-    read_message, validate_record_event, validate_run_id, write_message, Event, EventBatch,
-    HelloRequest, HelloResponse, Message, RecordEvent, RecordEventAck, StartCapture, StopCapture,
-    StopCaptureAck,
+    read_message, validate_run_id, write_message, HelloRequest, HelloResponse, Message,
+    StartCapture, StopCapture, StopCaptureAck,
 };
 use wattch_protocol::PROTOCOL_VERSION;
 
@@ -47,37 +45,11 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 const CAPTURE_BATCH_SLACK: u64 = 64;
 const MAX_CAPTURE_BATCH_BYTES: usize = 1024 * 1024;
 
-/// Blocking protocol client over a Unix socket.
+/// Blocking protocol v0.1 client over a Unix socket.
 #[derive(Debug)]
 pub struct WattchClient {
     stream: UnixStream,
     hello: HelloResponse,
-    next_event_batch_sequence_no: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum CaptureFrame {
-    RawSampleBatch(RawSampleBatch),
-    EventBatch(EventBatch),
-    RecordEventAck(RecordEventAck),
-    StopCaptureAck(StopCaptureAck),
-}
-
-/// Single-reader, single-writer view of an active daemon capture.
-///
-/// `record_event` and `stop` only write control frames. Call `read_next` from
-/// the same owner to consume raw data, daemon-stamped event batches, event
-/// acknowledgements, and the final stop acknowledgement in wire order.
-pub struct CaptureSession<'a> {
-    client: &'a mut WattchClient,
-    run_id: String,
-    validator: RawStreamValidator,
-    event_validator: EventStreamValidator,
-    sent_event_ids: BTreeSet<String>,
-    pending_events: BTreeMap<String, RecordEvent>,
-    awaiting_acks: BTreeMap<String, Event>,
-    stop_sent: bool,
-    complete: bool,
 }
 
 impl WattchClient {
@@ -114,9 +86,9 @@ impl WattchClient {
                 })
             }
         };
-        if !compatible_version(&hello.protocol_version) {
+        if hello.protocol_version != PROTOCOL_VERSION {
             return Err(ClientError::Protocol(format!(
-                "daemon protocol {} is not compatible with client protocol {}",
+                "daemon protocol {} does not match client protocol {}",
                 hello.protocol_version, PROTOCOL_VERSION
             )));
         }
@@ -124,19 +96,6 @@ impl WattchClient {
         if hello.node_id.trim().is_empty() {
             return Err(ClientError::Protocol(
                 "HelloResponse node_id must not be empty".to_string(),
-            ));
-        }
-        if hello.clock_instance_id.trim().is_empty() {
-            return Err(ClientError::Protocol(
-                "HelloResponse clock_instance_id must not be empty".to_string(),
-            ));
-        }
-        if hello.clock_instance_id.len() > 256
-            || hello.clock_instance_id.chars().any(char::is_control)
-        {
-            return Err(ClientError::Protocol(
-                "HelloResponse clock_instance_id must be at most 256 bytes and contain no control characters"
-                    .to_string(),
             ));
         }
         if let Some(source) = hello
@@ -150,11 +109,7 @@ impl WattchClient {
             )));
         }
 
-        Ok(Self {
-            stream,
-            hello,
-            next_event_batch_sequence_no: 0,
-        })
+        Ok(Self { stream, hello })
     }
 
     pub fn hello(&self) -> &HelloResponse {
@@ -165,26 +120,31 @@ impl WattchClient {
         &self.hello.sources
     }
 
-    pub fn start_capture(
+    /// Capture for roughly `duration`, invoking `on_batch` per batch.
+    ///
+    /// The active deadline is absolute: a silent or overproducing daemon
+    /// cannot keep the client draining indefinitely.
+    pub fn capture(
         &mut self,
         run_id: &str,
         interval_ms: u64,
-    ) -> Result<CaptureSession<'_>, ClientError> {
-        self.start_capture_sources(run_id, interval_ms, &[])
-    }
-
-    pub fn start_capture_sources(
-        &mut self,
-        run_id: &str,
-        interval_ms: u64,
-        source_ids: &[u32],
-    ) -> Result<CaptureSession<'_>, ClientError> {
+        duration: Duration,
+        mut on_batch: impl FnMut(RawSampleBatch),
+    ) -> Result<StopCaptureAck, ClientError> {
         validate_run_id(run_id).map_err(|reason| ClientError::Protocol(reason.to_string()))?;
         if interval_ms == 0 {
             return Err(ClientError::Protocol(
                 "interval_ms must be non-zero".to_string(),
             ));
         }
+        write_message(
+            &mut self.stream,
+            &Message::StartCapture(StartCapture {
+                run_id: run_id.to_string(),
+                interval_ms,
+                source_ids: vec![],
+            }),
+        )?;
 
         let advertised_ids: BTreeSet<u32> = self
             .hello
@@ -192,35 +152,6 @@ impl WattchClient {
             .iter()
             .map(|source| source.local_source_id)
             .collect();
-        let requested_ids: BTreeSet<u32> = source_ids.iter().copied().collect();
-        if requested_ids.len() != source_ids.len() {
-            return Err(ClientError::Protocol(
-                "source_ids must not contain duplicates".to_string(),
-            ));
-        }
-        if let Some(unknown) = requested_ids
-            .iter()
-            .find(|source_id| !advertised_ids.contains(source_id))
-        {
-            return Err(ClientError::Protocol(format!(
-                "source_ids contains unknown source id {unknown}"
-            )));
-        }
-        let expected_ids = if source_ids.is_empty() {
-            &advertised_ids
-        } else {
-            &requested_ids
-        };
-
-        write_message(
-            &mut self.stream,
-            &Message::StartCapture(StartCapture {
-                run_id: run_id.to_string(),
-                interval_ms,
-                source_ids: source_ids.to_vec(),
-            }),
-        )?;
-
         match read_message_before(&mut self.stream, CONTROL_TIMEOUT)? {
             Message::StartCaptureAck(ack) => {
                 if ack.run_id != run_id {
@@ -230,9 +161,9 @@ impl WattchClient {
                     )));
                 }
                 let accepted: BTreeSet<u32> = ack.accepted_source_ids.iter().copied().collect();
-                if accepted.len() != ack.accepted_source_ids.len() || &accepted != expected_ids {
+                if accepted.len() != ack.accepted_source_ids.len() || accepted != advertised_ids {
                     return Err(ClientError::Protocol(
-                        "StartCaptureAck accepted_source_ids do not exactly match requested sources"
+                        "StartCaptureAck accepted_source_ids do not exactly match advertised sources"
                             .to_string(),
                     ));
                 }
@@ -251,330 +182,118 @@ impl WattchClient {
             }
         }
 
-        let validator =
-            RawStreamValidator::new(run_id, self.hello.node_id.clone(), &self.hello.sources)?;
-        let event_validator = EventStreamValidator::new(
-            run_id.to_string(),
-            self.hello.node_id.clone(),
-            Some(self.next_event_batch_sequence_no),
-        );
-        Ok(CaptureSession {
-            client: self,
-            run_id: run_id.to_string(),
-            validator,
-            event_validator,
-            sent_event_ids: BTreeSet::new(),
-            pending_events: BTreeMap::new(),
-            awaiting_acks: BTreeMap::new(),
-            stop_sent: false,
-            complete: false,
-        })
-    }
-
-    /// Capture for roughly `duration`, invoking `on_batch` per raw batch.
-    ///
-    /// The active deadline is absolute: a silent or overproducing daemon
-    /// cannot keep the client draining indefinitely. This compatibility
-    /// wrapper ignores event frames; use `capture_with_events` or the
-    /// low-level session API when benchmark markers are required.
-    pub fn capture(
-        &mut self,
-        run_id: &str,
-        interval_ms: u64,
-        duration: Duration,
-        mut on_batch: impl FnMut(RawSampleBatch),
-    ) -> Result<StopCaptureAck, ClientError> {
-        self.capture_with_events(run_id, interval_ms, duration, |frame| {
-            if let CaptureFrame::RawSampleBatch(batch) = frame {
-                on_batch(batch);
-            }
-        })
-    }
-
-    /// Timed capture wrapper that exposes every v0.2 data/event frame.
-    pub fn capture_with_events(
-        &mut self,
-        run_id: &str,
-        interval_ms: u64,
-        duration: Duration,
-        mut on_frame: impl FnMut(CaptureFrame),
-    ) -> Result<StopCaptureAck, ClientError> {
-        let mut session = self.start_capture(run_id, interval_ms)?;
-
         let deadline = Instant::now()
             .checked_add(duration)
             .ok_or_else(|| ClientError::Protocol("capture duration is too large".to_string()))?;
         let expected_batches = expected_batch_count(duration, interval_ms);
         let stop_after_batches = expected_batches.saturating_add(CAPTURE_BATCH_SLACK);
         let hard_batch_limit = stop_after_batches.saturating_add(CAPTURE_BATCH_SLACK);
+        let mut validator =
+            RawStreamValidator::new(run_id, self.hello.node_id.clone(), &self.hello.sources)?;
+        let mut stop_sent = false;
         let mut stop_deadline = None;
         loop {
-            if !session.stop_sent()
-                && (Instant::now() >= deadline || session.batches_seen() >= stop_after_batches)
+            if !stop_sent
+                && (Instant::now() >= deadline || validator.batches_seen() >= stop_after_batches)
             {
-                session.stop()?;
+                self.send_stop(run_id)?;
+                stop_sent = true;
                 stop_deadline = Some(Instant::now().checked_add(STOP_GRACE).ok_or_else(|| {
                     ClientError::Protocol("stop deadline is too large".to_string())
                 })?);
             }
 
-            let read_deadline = if session.stop_sent() {
+            let read_deadline = if stop_sent {
                 stop_deadline
                     .ok_or_else(|| ClientError::Protocol("missing stop deadline".to_string()))?
             } else {
                 deadline
             };
             if Instant::now() >= read_deadline {
-                if !session.stop_sent() {
+                if !stop_sent {
                     continue;
                 }
+                let _ = self.stream.shutdown(Shutdown::Both);
                 return Err(ClientError::Protocol(
                     "daemon did not acknowledge StopCapture before the deadline".to_string(),
                 ));
             }
-            let frame = match session.read_next(nonzero_remaining(read_deadline)) {
-                Ok(frame) => frame,
-                Err(err) if client_timeout(&err) => continue,
-                Err(err) => return Err(err),
-            };
-            match frame {
-                CaptureFrame::RawSampleBatch(_)
-                | CaptureFrame::EventBatch(_)
-                | CaptureFrame::RecordEventAck(_) => {
-                    on_frame(frame);
-                    if session.batches_seen() > hard_batch_limit {
+            let message =
+                match read_message_before(&mut self.stream, nonzero_remaining(read_deadline)) {
+                    Ok(message) => message,
+                    Err(err) if wire_timeout(&err) => continue,
+                    Err(err) => return Err(err.into()),
+                };
+            match message {
+                Message::RawSampleBatch(batch) => {
+                    let encoded_len = serde_json::to_vec(&batch)
+                        .map_err(|err| ClientError::Protocol(err.to_string()))?
+                        .len();
+                    if encoded_len > MAX_CAPTURE_BATCH_BYTES {
+                        let _ = self.stream.shutdown(Shutdown::Both);
+                        return Err(ClientError::Protocol(format!(
+                            "raw batch is {encoded_len} bytes; limit is {MAX_CAPTURE_BATCH_BYTES}"
+                        )));
+                    }
+                    validator.validate(&batch)?;
+                    on_batch(batch);
+                    if validator.batches_seen() > hard_batch_limit {
+                        let _ = self.stream.shutdown(Shutdown::Both);
                         return Err(ClientError::Protocol(format!(
                             "daemon exceeded capture batch limit {hard_batch_limit}"
                         )));
                     }
                 }
-                CaptureFrame::StopCaptureAck(ack) => return Ok(ack),
+                Message::StopCaptureAck(ack) => {
+                    if !stop_sent {
+                        return Err(ClientError::Protocol(
+                            "daemon sent StopCaptureAck before StopCapture".to_string(),
+                        ));
+                    }
+                    if ack.run_id != run_id {
+                        return Err(ClientError::Protocol(format!(
+                            "StopCaptureAck run_id {:?} does not match {:?}",
+                            ack.run_id, run_id
+                        )));
+                    }
+                    if ack.batches_sent != validator.batches_seen()
+                        || ack.samples_sent != validator.samples_seen()
+                    {
+                        return Err(ClientError::Protocol(format!(
+                            "StopCaptureAck counts {}/{} do not match observed {}/{}",
+                            ack.batches_sent,
+                            ack.samples_sent,
+                            validator.batches_seen(),
+                            validator.samples_seen()
+                        )));
+                    }
+                    self.stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
+                    return Ok(ack);
+                }
+                Message::Error(err) => {
+                    return Err(ClientError::Daemon {
+                        code: err.code,
+                        message: err.message,
+                    })
+                }
+                other => {
+                    return Err(ClientError::Unexpected {
+                        got: format!("{:?}", other.kind()),
+                        expected: "RawSampleBatch or StopCaptureAck",
+                    })
+                }
             }
         }
     }
-}
 
-impl CaptureSession<'_> {
-    pub fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    pub fn batches_seen(&self) -> u64 {
-        self.validator.batches_seen()
-    }
-
-    pub fn samples_seen(&self) -> u64 {
-        self.validator.samples_seen()
-    }
-
-    pub fn stop_sent(&self) -> bool {
-        self.stop_sent
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    /// Send a marker request. Its daemon-stamped `EventBatch` and
-    /// `RecordEventAck` are returned by subsequent `read_next` calls.
-    pub fn record_event(&mut self, event: RecordEvent) -> Result<(), ClientError> {
-        if self.stop_sent || self.complete {
-            return Err(ClientError::Protocol(
-                "cannot record an event after stopping a capture".to_string(),
-            ));
-        }
-        validate_record_event(&event)
-            .map_err(|reason| ClientError::Protocol(reason.to_string()))?;
-        if event.run_id != self.run_id {
-            return Err(ClientError::Protocol(format!(
-                "RecordEvent run_id {:?} does not match active run {:?}",
-                event.run_id, self.run_id
-            )));
-        }
-        if self.sent_event_ids.contains(&event.event_id) {
-            return Err(ClientError::Protocol(format!(
-                "event_id {:?} was already used in this capture",
-                event.event_id
-            )));
-        }
+    fn send_stop(&mut self, run_id: &str) -> Result<(), ClientError> {
         write_message(
-            &mut self.client.stream,
-            &Message::RecordEvent(event.clone()),
-        )?;
-        self.sent_event_ids.insert(event.event_id.clone());
-        self.pending_events.insert(event.event_id.clone(), event);
-        Ok(())
-    }
-
-    /// Request capture termination. Continue calling `read_next` until it
-    /// returns `CaptureFrame::StopCaptureAck`.
-    pub fn stop(&mut self) -> Result<(), ClientError> {
-        if self.complete {
-            return Err(ClientError::Protocol(
-                "capture is already complete".to_string(),
-            ));
-        }
-        if self.stop_sent {
-            return Err(ClientError::Protocol(
-                "StopCapture was already sent".to_string(),
-            ));
-        }
-        write_message(
-            &mut self.client.stream,
+            &mut self.stream,
             &Message::StopCapture(StopCapture {
-                run_id: self.run_id.clone(),
+                run_id: run_id.to_string(),
             }),
         )?;
-        self.stop_sent = true;
         Ok(())
-    }
-
-    pub fn read_next(&mut self, timeout: Duration) -> Result<CaptureFrame, ClientError> {
-        if self.complete {
-            return Err(ClientError::Protocol(
-                "capture is already complete".to_string(),
-            ));
-        }
-        let message = read_message_before(&mut self.client.stream, timeout)?;
-        match message {
-            Message::RawSampleBatch(batch) => {
-                let encoded_len = serde_json::to_vec(&batch)
-                    .map_err(|err| ClientError::Protocol(err.to_string()))?
-                    .len();
-                if encoded_len > MAX_CAPTURE_BATCH_BYTES {
-                    let _ = self.client.stream.shutdown(Shutdown::Both);
-                    return Err(ClientError::Protocol(format!(
-                        "raw batch is {encoded_len} bytes; limit is {MAX_CAPTURE_BATCH_BYTES}"
-                    )));
-                }
-                self.validator.validate(&batch)?;
-                Ok(CaptureFrame::RawSampleBatch(batch))
-            }
-            Message::EventBatch(batch) => {
-                self.validate_event_batch(&batch)?;
-                self.client.next_event_batch_sequence_no = self
-                    .client
-                    .next_event_batch_sequence_no
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        ClientError::Protocol("event batch sequence overflow".to_string())
-                    })?;
-                Ok(CaptureFrame::EventBatch(batch))
-            }
-            Message::RecordEventAck(ack) => {
-                let event_id = ack.event.event_id.clone();
-                let stamped = self.awaiting_acks.remove(&event_id).ok_or_else(|| {
-                    ClientError::Protocol(format!(
-                        "RecordEventAck for {:?} arrived before its EventBatch",
-                        event_id
-                    ))
-                })?;
-                if ack.event != stamped {
-                    return Err(ClientError::Protocol(format!(
-                        "RecordEventAck for {:?} does not match its EventBatch",
-                        event_id
-                    )));
-                }
-                self.pending_events.remove(&event_id).ok_or_else(|| {
-                    ClientError::Protocol(format!(
-                        "RecordEventAck for unknown event {:?}",
-                        event_id
-                    ))
-                })?;
-                Ok(CaptureFrame::RecordEventAck(ack))
-            }
-            Message::StopCaptureAck(ack) => {
-                if !self.stop_sent {
-                    return Err(ClientError::Protocol(
-                        "daemon sent StopCaptureAck before StopCapture".to_string(),
-                    ));
-                }
-                if ack.run_id != self.run_id {
-                    return Err(ClientError::Protocol(format!(
-                        "StopCaptureAck run_id {:?} does not match {:?}",
-                        ack.run_id, self.run_id
-                    )));
-                }
-                if ack.batches_sent != self.validator.batches_seen()
-                    || ack.samples_sent != self.validator.samples_seen()
-                {
-                    return Err(ClientError::Protocol(format!(
-                        "StopCaptureAck counts {}/{} do not match observed {}/{}",
-                        ack.batches_sent,
-                        ack.samples_sent,
-                        self.validator.batches_seen(),
-                        self.validator.samples_seen()
-                    )));
-                }
-                if !self.pending_events.is_empty() || !self.awaiting_acks.is_empty() {
-                    return Err(ClientError::Protocol(
-                        "StopCaptureAck arrived before all event acknowledgements".to_string(),
-                    ));
-                }
-                self.client.stream.set_read_timeout(Some(CONTROL_TIMEOUT))?;
-                self.complete = true;
-                Ok(CaptureFrame::StopCaptureAck(ack))
-            }
-            Message::Error(err) => {
-                // The daemon keeps a capture alive after rejecting a malformed
-                // marker. Local validation makes this path exceptional, but
-                // do not retain an unresolvable pending request.
-                if self.pending_events.len() == 1 && self.awaiting_acks.is_empty() {
-                    self.pending_events.clear();
-                }
-                Err(ClientError::Daemon {
-                    code: err.code,
-                    message: err.message,
-                })
-            }
-            other => Err(ClientError::Unexpected {
-                got: format!("{:?}", other.kind()),
-                expected: "RawSampleBatch, EventBatch, RecordEventAck, or StopCaptureAck",
-            }),
-        }
-    }
-
-    fn validate_event_batch(&mut self, batch: &EventBatch) -> Result<(), ClientError> {
-        self.event_validator
-            .validate(batch)
-            .map_err(ClientError::Protocol)?;
-
-        // Validate the entire batch before mutating acknowledgement state.
-        let mut stamped = Vec::with_capacity(batch.events.len());
-        for event in &batch.events {
-            let request = self.pending_events.get(&event.event_id).ok_or_else(|| {
-                ClientError::Protocol(format!(
-                    "daemon emitted unsolicited event {:?}",
-                    event.event_id
-                ))
-            })?;
-            if request.run_id != event.run_id
-                || request.kind != event.kind
-                || request.labels != event.labels
-            {
-                return Err(ClientError::Protocol(format!(
-                    "daemon-stamped event {:?} changed client-supplied fields",
-                    event.event_id
-                )));
-            }
-            if self.awaiting_acks.contains_key(&event.event_id) {
-                return Err(ClientError::Protocol(format!(
-                    "duplicate EventBatch for {:?}",
-                    event.event_id
-                )));
-            }
-            stamped.push((event.event_id.clone(), event.clone()));
-        }
-        self.awaiting_acks.extend(stamped);
-        Ok(())
-    }
-}
-
-impl Drop for CaptureSession<'_> {
-    fn drop(&mut self) {
-        if !self.complete {
-            let _ = self.client.stream.shutdown(Shutdown::Both);
-        }
     }
 }
 
@@ -597,10 +316,6 @@ fn wire_timeout(error: &WireError) -> bool {
         WireError::Io(source)
             if matches!(source.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
     )
-}
-
-fn client_timeout(error: &ClientError) -> bool {
-    matches!(error, ClientError::Wire(source) if wire_timeout(source))
 }
 
 struct DeadlineReader<'a> {
@@ -627,32 +342,4 @@ fn read_message_before(stream: &mut UnixStream, timeout: Duration) -> Result<Mes
         .checked_add(timeout)
         .ok_or_else(|| WireError::Io(io::Error::other("read deadline is too large")))?;
     read_message(&mut DeadlineReader { stream, deadline })
-}
-
-fn compatible_version(daemon_version: &str) -> bool {
-    daemon_version
-        .split('.')
-        .take(2)
-        .eq(PROTOCOL_VERSION.split('.').take(2))
-}
-
-#[cfg(test)]
-mod version_tests {
-    use super::compatible_version;
-    use wattch_protocol::PROTOCOL_VERSION;
-
-    #[test]
-    fn live_protocol_accepts_same_major_minor_patch_versions() {
-        assert!(compatible_version(PROTOCOL_VERSION));
-        assert!(compatible_version("0.2.99"));
-    }
-
-    #[test]
-    fn live_protocol_rejects_other_or_malformed_versions() {
-        assert!(!compatible_version("0.1.99"));
-        assert!(!compatible_version("0.3.0"));
-        assert!(!compatible_version("1.2.0"));
-        assert!(!compatible_version(""));
-        assert!(!compatible_version("garbage"));
-    }
 }

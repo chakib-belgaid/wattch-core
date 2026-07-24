@@ -23,9 +23,6 @@ enum Temporality {
   DELTA = 3;
   GAUGE = 4;
   EVENT = 5;
-  // Average over a raw, descriptor-linked duration interval. The descriptor
-  // declares its daemon-clock anchor; compact RawSample remains unchanged.
-  INTERVAL_AVERAGE = 6;
 }
 
 enum Unit {
@@ -39,15 +36,12 @@ enum Unit {
   HERTZ = 7;
   CELSIUS = 8;
   BYTE = 9;
-  MILLIWATT = 10;
 }
 
 enum SamplingMode {
   SAMPLING_MODE_UNSPECIFIED = 0;
   PERIODIC = 1;
-  // The implemented JSON value is "EVENT". Protobuf enum values share package
-  // scope, so this symbol is prefixed to avoid colliding with Temporality.EVENT.
-  SAMPLING_MODE_EVENT = 2;
+  EVENT_DRIVEN = 2;
   POLLED = 3;
   IMPORTED = 4;
   SYNTHETIC = 5;
@@ -131,8 +125,7 @@ message EventBatch {
 message HelloRequest {
   string client_name = 1;
   string client_version = 2;
-  // Implemented JSON transports negotiate one exact major/minor version.
-  string protocol_version = 3;
+  repeated string accepted_protocol_versions = 3;
 }
 
 message HelloResponse {
@@ -141,9 +134,6 @@ message HelloResponse {
   string protocol_version = 3;
   string node_id = 4;
   repeated SourceDescriptor sources = 5;
-  // Opaque identity for the daemon-wide monotonic clock epoch. Stable for
-  // one daemon lifetime and changed when the daemon restarts.
-  string clock_instance_id = 6;
 }
 
 message StartCapture {
@@ -151,57 +141,19 @@ message StartCapture {
   string run_id = 1;
   // Unique ids drawn from HelloResponse.sources.
   repeated uint32 source_ids = 2;
-  // Requested collection interval used by the implemented v0.1/v0.2 JSON
-  // payload. The daemon may reject an invalid or unsupported interval.
-  uint64 interval_ms = 3;
-
-  // Tag 4 appeared as an unimplemented labels draft. Do not reuse it if the
-  // transport later moves from JSON to protobuf payloads.
-  reserved 4;
-  reserved "labels";
+  optional uint64 requested_period_ns = 3;
+  map<string, string> labels = 4;
 }
 
 message StopCapture {
   string run_id = 1;
-
-  // Tag 2 appeared as an unimplemented reason draft. The implemented wire
-  // request contains only the active run identity.
-  reserved 2;
-  reserved "reason";
-}
-
-message StartCaptureAck {
-  string run_id = 1;
-  repeated uint32 accepted_source_ids = 2;
-}
-
-message StopCaptureAck {
-  string run_id = 1;
-  uint64 batches_sent = 2;
-  uint64 samples_sent = 3;
-}
-
-// Client request for a daemon-stamped benchmark marker. Node identity and
-// monotonic time are intentionally absent: the daemon owns both values.
-message RecordEvent {
-  string run_id = 1;
-  string event_id = 2;
-  string kind = 3;
-  map<string, string> labels = 4;
-}
-
-message RecordEventAck {
-  Event event = 1;
+  string reason = 2;
 }
 
 message Error {
-  uint32 code = 1;
+  string code = 1;
   string message = 2;
-
-  // Retryability is determined by the documented numeric code semantics; it
-  // is not an implemented wire field.
-  reserved 3;
-  reserved "retryable";
+  bool retryable = 3;
 }
 
 message FramePayload {
@@ -210,10 +162,6 @@ message FramePayload {
     HelloResponse hello_response = 2;
     StartCapture start_capture = 3;
     StopCapture stop_capture = 4;
-    StartCaptureAck start_capture_ack = 5;
-    StopCaptureAck stop_capture_ack = 6;
-    RecordEvent record_event = 7;
-    RecordEventAck record_event_ack = 8;
     RawSampleBatch raw_sample_batch = 10;
     EventBatch event_batch = 11;
     Error error = 255;

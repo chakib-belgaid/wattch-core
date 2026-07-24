@@ -4,11 +4,9 @@ use thiserror::Error;
 pub const MAGIC: [u8; 4] = *b"WCH0";
 pub const FRAME_HEADER_LEN: usize = 16;
 pub const WIRE_VERSION_MAJOR: u16 = 0;
-pub const WIRE_VERSION_MINOR: u16 = 2;
-pub const MIN_READABLE_WIRE_VERSION_MINOR: u16 = 1;
+pub const WIRE_VERSION_MINOR: u16 = 1;
 
-/// Reserved flag bit: payload is protobuf instead of JSON. Not used in v0.1
-/// or v0.2.
+/// Reserved flag bit: payload is protobuf instead of JSON. Not used in v0.1.
 pub const FLAG_PAYLOAD_PROTOBUF: u16 = 0b1;
 
 /// Upper bound for a single frame payload. Control-plane messages are small
@@ -25,8 +23,6 @@ pub enum FrameKind {
     StopCapture = 4,
     StartCaptureAck = 5,
     StopCaptureAck = 6,
-    RecordEvent = 7,
-    RecordEventAck = 8,
     RawSampleBatch = 10,
     EventBatch = 11,
     Error = 255,
@@ -43,8 +39,6 @@ impl TryFrom<u16> for FrameKind {
             4 => Ok(Self::StopCapture),
             5 => Ok(Self::StartCaptureAck),
             6 => Ok(Self::StopCaptureAck),
-            7 => Ok(Self::RecordEvent),
-            8 => Ok(Self::RecordEventAck),
             10 => Ok(Self::RawSampleBatch),
             11 => Ok(Self::EventBatch),
             255 => Ok(Self::Error),
@@ -55,8 +49,6 @@ impl TryFrom<u16> for FrameKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
-    pub wire_version_major: u16,
-    pub wire_version_minor: u16,
     pub kind: FrameKind,
     pub payload_len: u32,
     pub flags: u16,
@@ -129,9 +121,7 @@ pub fn decode_header(buf: &[u8]) -> Result<FrameHeader, FrameError> {
 
     let major = u16::from_le_bytes([buf[4], buf[5]]);
     let minor = u16::from_le_bytes([buf[6], buf[7]]);
-    if major != WIRE_VERSION_MAJOR
-        || !(MIN_READABLE_WIRE_VERSION_MINOR..=WIRE_VERSION_MINOR).contains(&minor)
-    {
+    if major != WIRE_VERSION_MAJOR || minor != WIRE_VERSION_MINOR {
         return Err(FrameError::UnsupportedVersion { major, minor });
     }
 
@@ -140,8 +130,6 @@ pub fn decode_header(buf: &[u8]) -> Result<FrameHeader, FrameError> {
     let payload_len = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
 
     Ok(FrameHeader {
-        wire_version_major: major,
-        wire_version_minor: minor,
         kind: FrameKind::try_from(raw_kind)?,
         payload_len,
         flags,
@@ -166,19 +154,6 @@ pub fn write_frame(
 /// Returns [`WireError::ConnectionClosed`] when the stream ends cleanly at a
 /// frame boundary.
 pub fn read_frame(reader: &mut impl Read) -> Result<(FrameHeader, Vec<u8>), WireError> {
-    read_frame_with_payload_limit(reader, MAX_PAYLOAD_LEN)
-}
-
-/// Read one complete frame using an explicit payload bound.
-///
-/// Live daemon/client transports must use [`read_frame`], which retains the
-/// 16 MiB protocol safety limit. This variant exists for bounded offline
-/// artifact migration, where historical v0.1 traces may contain larger
-/// batches. Callers must supply a finite artifact-specific limit.
-pub fn read_frame_with_payload_limit(
-    reader: &mut impl Read,
-    max_payload_len: u32,
-) -> Result<(FrameHeader, Vec<u8>), WireError> {
     let mut header_buf = [0u8; FRAME_HEADER_LEN];
     let mut filled = 0;
     while filled < FRAME_HEADER_LEN {
@@ -193,7 +168,7 @@ pub fn read_frame_with_payload_limit(
     }
 
     let header = decode_header(&header_buf)?;
-    if header.payload_len > max_payload_len {
+    if header.payload_len > MAX_PAYLOAD_LEN {
         return Err(WireError::Frame(FrameError::PayloadTooLarge(
             header.payload_len as usize,
         )));
@@ -213,8 +188,6 @@ mod tests {
     fn round_trips_header() {
         let frame = encode_frame(FrameKind::RawSampleBatch, 0, b"abc").unwrap();
         let header = decode_header(&frame).unwrap();
-        assert_eq!(header.wire_version_major, 0);
-        assert_eq!(header.wire_version_minor, 2);
         assert_eq!(header.kind, FrameKind::RawSampleBatch);
         assert_eq!(header.payload_len, 3);
         assert_eq!(&frame[FRAME_HEADER_LEN..], b"abc");
@@ -222,48 +195,9 @@ mod tests {
 
     #[test]
     fn round_trips_ack_kinds() {
-        for kind in [
-            FrameKind::StartCaptureAck,
-            FrameKind::StopCaptureAck,
-            FrameKind::RecordEventAck,
-        ] {
+        for kind in [FrameKind::StartCaptureAck, FrameKind::StopCaptureAck] {
             let frame = encode_frame(kind, 0, b"{}").unwrap();
             assert_eq!(decode_header(&frame).unwrap().kind, kind);
-        }
-    }
-
-    #[test]
-    fn v0_2_frame_kind_numbers_are_stable() {
-        assert_eq!(FrameKind::RecordEvent as u16, 7);
-        assert_eq!(FrameKind::RecordEventAck as u16, 8);
-        assert_eq!(FrameKind::RawSampleBatch as u16, 10);
-        assert_eq!(FrameKind::EventBatch as u16, 11);
-    }
-
-    #[test]
-    fn reads_v0_1_frame_headers() {
-        let mut frame = encode_frame(FrameKind::RawSampleBatch, 0, b"legacy").unwrap();
-        frame[6..8].copy_from_slice(&1u16.to_le_bytes());
-
-        let header = decode_header(&frame).unwrap();
-        assert_eq!(header.wire_version_major, 0);
-        assert_eq!(header.wire_version_minor, 1);
-        assert_eq!(header.kind, FrameKind::RawSampleBatch);
-    }
-
-    #[test]
-    fn rejects_wire_versions_outside_supported_range() {
-        for (major, minor) in [(0u16, 0u16), (0, 3), (1, 2)] {
-            let mut frame = encode_frame(FrameKind::HelloRequest, 0, b"").unwrap();
-            frame[4..6].copy_from_slice(&major.to_le_bytes());
-            frame[6..8].copy_from_slice(&minor.to_le_bytes());
-            assert!(matches!(
-                decode_header(&frame),
-                Err(FrameError::UnsupportedVersion {
-                    major: got_major,
-                    minor: got_minor,
-                }) if got_major == major && got_minor == minor
-            ));
         }
     }
 
@@ -304,44 +238,6 @@ mod tests {
         assert!(matches!(
             read_frame(&mut Cursor::new(frame)),
             Err(WireError::Frame(FrameError::PayloadTooLarge(_)))
-        ));
-    }
-
-    #[test]
-    fn explicit_offline_limit_can_read_a_legacy_oversized_payload() {
-        let payload = vec![b' '; MAX_PAYLOAD_LEN as usize + 1];
-        let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-        frame.extend_from_slice(&MAGIC);
-        frame.extend_from_slice(&WIRE_VERSION_MAJOR.to_le_bytes());
-        frame.extend_from_slice(&1u16.to_le_bytes());
-        frame.extend_from_slice(&(FrameKind::RawSampleBatch as u16).to_le_bytes());
-        frame.extend_from_slice(&0u16.to_le_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&payload);
-
-        assert!(matches!(
-            read_frame(&mut Cursor::new(&frame)),
-            Err(WireError::Frame(FrameError::PayloadTooLarge(_)))
-        ));
-        let (header, decoded) =
-            read_frame_with_payload_limit(&mut Cursor::new(frame), MAX_PAYLOAD_LEN + 1).unwrap();
-        assert_eq!(header.wire_version_minor, 1);
-        assert_eq!(decoded.len(), payload.len());
-    }
-
-    #[test]
-    fn explicit_offline_limit_still_rejects_payloads_above_its_bound() {
-        let mut frame = encode_frame(FrameKind::RawSampleBatch, 0, b"").unwrap();
-        frame[6..8].copy_from_slice(&1u16.to_le_bytes());
-        frame[12..16].copy_from_slice(&(MAX_PAYLOAD_LEN + 2).to_le_bytes());
-
-        assert!(matches!(
-            read_frame_with_payload_limit(
-                &mut Cursor::new(frame),
-                MAX_PAYLOAD_LEN + 1,
-            ),
-            Err(WireError::Frame(FrameError::PayloadTooLarge(length)))
-                if length == MAX_PAYLOAD_LEN as usize + 2
         ));
     }
 

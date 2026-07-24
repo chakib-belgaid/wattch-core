@@ -8,20 +8,12 @@ from pywattch import (
     WattchProtocolError,
 )
 from pywattch import client as client_module
-from pywattch._messages import (
-    EventBatch,
-    HelloResponse,
-    RawSample,
-    RawSampleBatch,
-    StartCaptureAck,
-)
+from pywattch._messages import HelloResponse, RawSample, RawSampleBatch, StartCaptureAck
 
 
 def test_hello_exposes_sources(fake_daemon):
     with WattchClient(fake_daemon.socket_path) as client:
         assert client.node_id == "fake-node"
-        assert client.protocol_version == "0.2.0"
-        assert client.clock_instance_id == "fake-clock-instance"
         assert client.hello.daemon_name == "fake-daemon"
         paths = [s.source_path for s in client.sources]
         assert paths == [
@@ -33,14 +25,6 @@ def test_hello_exposes_sources(fake_daemon):
         assert package.unit == "MICROJOULE"
         assert package.temporality == "CUMULATIVE"
         assert package.max_value == 1_000_000.0
-
-
-def test_live_protocol_accepts_patch_compatible_versions():
-    assert client_module._compatible_protocol_version("0.2.0")
-    assert client_module._compatible_protocol_version("0.2.99")
-    assert not client_module._compatible_protocol_version("0.1.99")
-    assert not client_module._compatible_protocol_version("0.3.0")
-    assert not client_module._compatible_protocol_version("garbage")
 
 
 def test_capture_returns_batches_with_monotonic_sequences(fake_daemon):
@@ -128,10 +112,9 @@ def test_start_capture_with_wrong_message_type_raises_protocol_error(fake_daemon
         bogus = HelloResponse(
             daemon_name="x",
             daemon_version="0",
-            protocol_version="0.2.0",
+            protocol_version="0.1.0",
             node_id="fake-node",
             sources=(),
-            clock_instance_id="clock-x",
         )
         monkeypatch.setattr(client_module, "decode_payload", lambda kind, payload: bogus)
         with pytest.raises(WattchProtocolError, match="StartCaptureAck"):
@@ -202,50 +185,3 @@ def test_run_id_and_post_stop_drain_are_bounded(fake_daemon):
         client.start_capture("bounded-drain", interval_ms=5)
         with pytest.raises(WattchProtocolError, match="drain limit"):
             client.stop_capture("bounded-drain", max_drained_batches=0)
-
-
-def test_record_event_preserves_raw_batches_and_authoritative_event_batch(fake_daemon):
-    with WattchClient(fake_daemon.socket_path) as client:
-        client.start_capture("event-run", interval_ms=5)
-        ack = client.record_event(
-            "event-run",
-            "target-exec",
-            "TARGET_EXEC",
-            {"program": "p1"},
-        )
-        assert ack.event.event_id == "target-exec"
-        assert ack.event.run_id == "event-run"
-        assert ack.event.node_id == "fake-node"
-        assert ack.event.kind == "TARGET_EXEC"
-        assert ack.event.labels == {"program": "p1"}
-
-        event_batches = client.take_event_batches()
-        assert len(event_batches) == 1
-        assert event_batches[0].events == (ack.event,)
-
-        message = client.read_batch()
-        assert isinstance(message, RawSampleBatch)
-        client.stop_capture("event-run")
-
-
-def test_callback_capture_dispatches_events_before_record_ack(fake_daemon):
-    raw_batches: list[RawSampleBatch] = []
-    event_batches: list[EventBatch] = []
-    with WattchClient(fake_daemon.socket_path) as client:
-        client.start_capture(
-            "callback-run",
-            interval_ms=5,
-            on_raw_batch=raw_batches.append,
-            on_event_batch=event_batches.append,
-        )
-        ack = client.record_event(
-            "callback-run", "spawn", "TARGET_SPAWN", {"arm": "C1"}
-        )
-        assert event_batches
-        assert event_batches[-1].events == (ack.event,)
-        stop_ack, drained = client.stop_capture("callback-run")
-
-    assert drained == []
-    assert raw_batches
-    assert stop_ack.batches_sent == len(raw_batches)
-    assert stop_ack.samples_sent == sum(len(batch.samples) for batch in raw_batches)

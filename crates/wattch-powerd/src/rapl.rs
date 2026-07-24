@@ -3,12 +3,11 @@
 //! Layout under the powercap root (default `/sys/class/powercap`):
 //!
 //! ```text
-//! intel-rapl:0/            package (or psys) zone from the MSR driver
+//! intel-rapl:0/            package (or psys) zone
 //!   name                   e.g. "package-0"
 //!   energy_uj              cumulative microjoules
 //!   max_energy_range_uj    wrap point
 //!   intel-rapl:0:0/        subzone, e.g. "core", "uncore", "dram"
-//! intel-rapl-mmio:0/       independent MMIO driver namespace
 //! ```
 //!
 //! The scan is rooted at a configurable directory so it can be exercised on
@@ -25,21 +24,6 @@ use wattch_core::{
 };
 use wattch_daemon::SampleBackend;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum DriverNamespace {
-    Msr,
-    Mmio,
-}
-
-impl DriverNamespace {
-    fn sysfs_prefix(self) -> &'static str {
-        match self {
-            Self::Msr => "intel-rapl",
-            Self::Mmio => "intel-rapl-mmio",
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum RaplError {
     #[error("powercap root {0} does not exist")]
@@ -47,13 +31,6 @@ pub enum RaplError {
 
     #[error("no RAPL zones found under {0}")]
     NoZones(PathBuf),
-
-    #[error("duplicate RAPL zone identity {identity:?} at {first} and {second}")]
-    DuplicateZoneIdentity {
-        identity: String,
-        first: PathBuf,
-        second: PathBuf,
-    },
 
     #[error("failed to read {path}: {source}")]
     Read {
@@ -84,9 +61,6 @@ fn read_u64(path: &Path) -> Result<u64, RaplError> {
 
 struct Zone {
     dir: PathBuf,
-    /// Powercap driver namespace. Numeric ids are only unique within this
-    /// namespace: `intel-rapl:0` and `intel-rapl-mmio:0` may coexist.
-    driver_namespace: DriverNamespace,
     /// Zone id segments, e.g. `[0]` for a package, `[0, 1]` for a subzone.
     id_segments: Vec<u32>,
     name: String,
@@ -113,22 +87,12 @@ fn scan_zones(root: &Path) -> Result<Vec<Zone>, RaplError> {
                 continue;
             }
             let file_name = entry.file_name().to_string_lossy().to_string();
-            if matches!(file_name.as_str(), "intel-rapl" | "intel-rapl-mmio") {
-                // Current kernels commonly group zones under one directory
-                // per driver. Older/alternate mounts may expose the zones
-                // directly under the configured root, which remains
-                // supported below.
-                stack.push(path);
+            let Some(id_part) = file_name
+                .strip_prefix("intel-rapl-mmio:")
+                .or_else(|| file_name.strip_prefix("intel-rapl:"))
+            else {
                 continue;
-            }
-            let (driver_namespace, id_part) =
-                if let Some(id_part) = file_name.strip_prefix("intel-rapl-mmio:") {
-                    (DriverNamespace::Mmio, id_part)
-                } else if let Some(id_part) = file_name.strip_prefix("intel-rapl:") {
-                    (DriverNamespace::Msr, id_part)
-                } else {
-                    continue;
-                };
+            };
             let Ok(id_segments) = id_part
                 .split(':')
                 .map(|s| s.parse::<u32>())
@@ -144,7 +108,6 @@ fn scan_zones(root: &Path) -> Result<Vec<Zone>, RaplError> {
             stack.push(path.clone());
             zones.push(Zone {
                 dir: path,
-                driver_namespace,
                 id_segments,
                 name,
                 max_energy_range_uj,
@@ -155,23 +118,7 @@ fn scan_zones(root: &Path) -> Result<Vec<Zone>, RaplError> {
     if zones.is_empty() {
         return Err(RaplError::NoZones(root.to_path_buf()));
     }
-    let mut identities = BTreeMap::new();
-    for zone in &zones {
-        let identity = zone_identity(zone);
-        if let Some(first) = identities.insert(identity.clone(), zone.dir.clone()) {
-            return Err(RaplError::DuplicateZoneIdentity {
-                identity,
-                first,
-                second: zone.dir.clone(),
-            });
-        }
-    }
-    zones.sort_by(|a, b| {
-        a.driver_namespace
-            .cmp(&b.driver_namespace)
-            .then(a.id_segments.cmp(&b.id_segments))
-            .then(a.dir.cmp(&b.dir))
-    });
+    zones.sort_by(|a, b| a.id_segments.cmp(&b.id_segments).then(a.dir.cmp(&b.dir)));
     Ok(zones)
 }
 
@@ -180,7 +127,6 @@ fn kind_for(zone_name: &str) -> SourceKind {
         SourceKind::CpuPackageEnergy
     } else {
         match zone_name {
-            "psys" => SourceKind::PlatformEnergy,
             "core" => SourceKind::CpuCoreEnergy,
             "dram" => SourceKind::DramEnergy,
             _ => SourceKind::Other,
@@ -188,27 +134,24 @@ fn kind_for(zone_name: &str) -> SourceKind {
     }
 }
 
-fn zone_identity(zone: &Zone) -> String {
-    let ids = zone
-        .id_segments
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(":");
-    format!("{}:{ids}", zone.driver_namespace.sysfs_prefix())
-}
-
-fn source_path_for(zone: &Zone) -> String {
-    let ids = zone
-        .id_segments
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join("/");
-    format!(
-        "powercap/{}/{ids}/energy",
-        zone.driver_namespace.sysfs_prefix()
-    )
+fn source_path_for(zone: &Zone, parent: Option<&Zone>) -> String {
+    match parent {
+        None => {
+            if zone.name.starts_with("package") {
+                format!("cpu/package/{}/energy", zone.id_segments[0])
+            } else {
+                format!("platform/{}/energy", zone.name)
+            }
+        }
+        Some(parent_zone) => {
+            let parent_base = if parent_zone.name.starts_with("package") {
+                format!("cpu/package/{}", parent_zone.id_segments[0])
+            } else {
+                format!("platform/{}", parent_zone.name)
+            };
+            format!("{parent_base}/{}/energy", zone.name)
+        }
+    }
 }
 
 /// RAPL backend: one source per powercap zone, cumulative microjoules.
@@ -232,35 +175,40 @@ impl RaplBackend {
         for (index, zone) in zones.iter().enumerate() {
             let local_source_id = index as u32 + 1;
             let parent = if zone.id_segments.len() > 1 {
-                zones.iter().find(|candidate| {
-                    candidate.driver_namespace == zone.driver_namespace
-                        && candidate.id_segments == zone.id_segments[..zone.id_segments.len() - 1]
-                })
+                zones
+                    .iter()
+                    .find(|z| z.id_segments == zone.id_segments[..zone.id_segments.len() - 1])
             } else {
                 None
             };
 
-            let identity = zone_identity(zone);
+            let dir_name = zone
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             let mut labels = BTreeMap::new();
-            labels.insert("zone".to_string(), identity.clone());
+            labels.insert("zone".to_string(), dir_name.clone());
             labels.insert("zone_name".to_string(), zone.name.clone());
-            labels.insert(
-                "driver_namespace".to_string(),
-                zone.driver_namespace.sysfs_prefix().to_string(),
-            );
 
             descriptors.push(SourceDescriptor {
                 local_source_id,
-                source_uid: format!("rapl://{node_id}/{identity}"),
+                source_uid: format!("rapl://{node_id}/{dir_name}"),
                 node_id: node_id.to_string(),
                 backend: "linux-rapl".to_string(),
                 kind: kind_for(&zone.name),
                 unit: Unit::Microjoule,
                 temporality: Temporality::Cumulative,
                 evidence_class: EvidenceClass::RawHardwareCounter,
-                source_path: source_path_for(zone),
-                parent_source_uid: parent
-                    .map(|parent| format!("rapl://{node_id}/{}", zone_identity(parent))),
+                source_path: source_path_for(zone, parent),
+                parent_source_uid: parent.map(|p| {
+                    let parent_dir = p
+                        .dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    format!("rapl://{node_id}/{parent_dir}")
+                }),
                 clock_domain: "monotonic".to_string(),
                 sampling_mode: SamplingMode::Polled,
                 nominal_period_ns: None,
@@ -312,11 +260,6 @@ impl SampleBackend for RaplBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
-    use wattch_core::{
-        validate_measurement_boundary, AggregationRule, BoundarySourceSignature,
-        MeasurementBoundary,
-    };
 
     fn write_zone(dir: &Path, name: &str, energy: u64, max: u64) {
         fs::create_dir_all(dir).unwrap();
@@ -332,8 +275,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let msr_root = root.join("intel-rapl");
-        let pkg0 = msr_root.join("intel-rapl:0");
+        let pkg0 = root.join("intel-rapl:0");
         write_zone(&pkg0, "package-0", 1_000_000, 262_143_328_850);
         write_zone(
             &pkg0.join("intel-rapl:0:0"),
@@ -348,30 +290,12 @@ mod tests {
             65_712_999_613,
         );
         write_zone(
-            &msr_root.join("intel-rapl:1"),
+            &root.join("intel-rapl:1"),
             "psys",
             5_000_000,
             262_143_328_850,
         );
         root
-    }
-
-    fn signature(source: &SourceDescriptor) -> BoundarySourceSignature {
-        BoundarySourceSignature::from_descriptor(source)
-    }
-
-    fn child_boundary(
-        boundary_id: &str,
-        parent: &SourceDescriptor,
-        child: &SourceDescriptor,
-    ) -> MeasurementBoundary {
-        MeasurementBoundary {
-            boundary_id: boundary_id.to_string(),
-            backend: "linux-rapl".to_string(),
-            primary_source_uids: vec![child.source_uid.clone()],
-            aggregation_rule: AggregationRule::SingleSource,
-            required_sources: vec![signature(parent), signature(child)],
-        }
     }
 
     #[test]
@@ -382,7 +306,7 @@ mod tests {
         assert_eq!(descriptors.len(), 4);
 
         let package = &descriptors[0];
-        assert_eq!(package.source_path, "powercap/intel-rapl/0/energy");
+        assert_eq!(package.source_path, "cpu/package/0/energy");
         assert_eq!(package.kind, SourceKind::CpuPackageEnergy);
         assert_eq!(package.unit, Unit::Microjoule);
         assert_eq!(package.temporality, Temporality::Cumulative);
@@ -390,14 +314,10 @@ mod tests {
         assert_eq!(package.max_value, Some(262_143_328_850.0));
         assert_eq!(package.parent_source_uid, None);
         assert_eq!(package.source_uid, "rapl://node-x/intel-rapl:0");
-        assert_eq!(
-            package.labels.get("driver_namespace").map(String::as_str),
-            Some("intel-rapl")
-        );
 
         let core = descriptors
             .iter()
-            .find(|d| d.source_path == "powercap/intel-rapl/0/0/energy")
+            .find(|d| d.source_path == "cpu/package/0/core/energy")
             .expect("core subzone");
         assert_eq!(core.kind, SourceKind::CpuCoreEnergy);
         assert_eq!(
@@ -407,102 +327,15 @@ mod tests {
 
         let dram = descriptors
             .iter()
-            .find(|d| d.source_path == "powercap/intel-rapl/0/1/energy")
+            .find(|d| d.source_path == "cpu/package/0/dram/energy")
             .expect("dram subzone");
         assert_eq!(dram.kind, SourceKind::DramEnergy);
 
         let psys = descriptors
             .iter()
-            .find(|d| d.source_path == "powercap/intel-rapl/1/energy")
+            .find(|d| d.source_path == "platform/psys/energy")
             .expect("psys zone");
-        assert_eq!(psys.kind, SourceKind::PlatformEnergy);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn overlapping_msr_and_mmio_zone_ids_keep_independent_topologies() {
-        let root = fake_tree("dual-driver");
-        let mmio_package = root.join("intel-rapl-mmio/intel-rapl-mmio:0");
-        write_zone(&mmio_package, "package-0", 2_000_000, 262_143_328_850);
-        write_zone(
-            &mmio_package.join("intel-rapl-mmio:0:0"),
-            "core",
-            800_000,
-            262_143_328_850,
-        );
-
-        let backend = RaplBackend::new(&root, "node-x").unwrap();
-        let descriptors = backend.descriptors();
-        assert_eq!(descriptors.len(), 6);
-
-        let source_uids = descriptors
-            .iter()
-            .map(|source| source.source_uid.as_str())
-            .collect::<BTreeSet<_>>();
-        let source_paths = descriptors
-            .iter()
-            .map(|source| source.source_path.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(source_uids.len(), descriptors.len());
-        assert_eq!(source_paths.len(), descriptors.len());
-
-        let msr_package = descriptors
-            .iter()
-            .find(|source| source.source_uid == "rapl://node-x/intel-rapl:0")
-            .unwrap();
-        let msr_core = descriptors
-            .iter()
-            .find(|source| source.source_uid == "rapl://node-x/intel-rapl:0:0")
-            .unwrap();
-        let mmio_package = descriptors
-            .iter()
-            .find(|source| source.source_uid == "rapl://node-x/intel-rapl-mmio:0")
-            .unwrap();
-        let mmio_core = descriptors
-            .iter()
-            .find(|source| source.source_uid == "rapl://node-x/intel-rapl-mmio:0:0")
-            .unwrap();
-
-        assert_eq!(
-            msr_core.parent_source_uid.as_deref(),
-            Some(msr_package.source_uid.as_str())
-        );
-        assert_eq!(
-            mmio_core.parent_source_uid.as_deref(),
-            Some(mmio_package.source_uid.as_str())
-        );
-        assert_ne!(msr_package.source_path, mmio_package.source_path);
-        assert_ne!(msr_core.source_path, mmio_core.source_path);
-
-        let msr_boundary = child_boundary("msr-core", msr_package, msr_core);
-        let mmio_boundary = child_boundary("mmio-core", mmio_package, mmio_core);
-        validate_measurement_boundary(&msr_boundary, descriptors).unwrap();
-        validate_measurement_boundary(&mmio_boundary, descriptors).unwrap();
-
-        let mut cross_driver_boundary = mmio_boundary;
-        cross_driver_boundary.required_sources = vec![signature(msr_package), {
-            let mut child = signature(mmio_core);
-            child.parent_source_uid = Some(msr_package.source_uid.clone());
-            child
-        }];
-        assert!(validate_measurement_boundary(&cross_driver_boundary, descriptors).is_err());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn duplicate_identity_is_rejected_instead_of_emitting_ambiguous_uids() {
-        let root = fake_tree("duplicate-zone-identity");
-        write_zone(
-            &root.join("intel-rapl/intel-rapl:0/intel-rapl:0"),
-            "duplicate-package-0",
-            3_000_000,
-            262_143_328_850,
-        );
-
-        let error = RaplBackend::new(&root, "node-x").unwrap_err();
-        assert!(matches!(error, RaplError::DuplicateZoneIdentity { .. }));
+        assert_eq!(psys.kind, SourceKind::Other);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -517,7 +350,7 @@ mod tests {
         assert_eq!(package.1, RawValue::I64(1_000_000));
 
         // Counter advances between reads.
-        fs::write(root.join("intel-rapl/intel-rapl:0/energy_uj"), "1500000\n").unwrap();
+        fs::write(root.join("intel-rapl:0/energy_uj"), "1500000\n").unwrap();
         let readings = backend.sample();
         let package = readings.iter().find(|(id, _)| *id == 1).unwrap();
         assert_eq!(package.1, RawValue::I64(1_500_000));
@@ -529,7 +362,7 @@ mod tests {
     fn unreadable_zone_is_skipped_not_fatal() {
         let root = fake_tree("skip");
         let mut backend = RaplBackend::new(&root, "node-x").unwrap();
-        fs::write(root.join("intel-rapl/intel-rapl:0/energy_uj"), "garbage\n").unwrap();
+        fs::write(root.join("intel-rapl:0/energy_uj"), "garbage\n").unwrap();
         let readings = backend.sample();
         assert_eq!(readings.len(), 3);
         assert!(!readings.iter().any(|(id, _)| *id == 1));
@@ -542,7 +375,7 @@ mod tests {
         let root = fake_tree("overflow");
         let mut backend = RaplBackend::new(&root, "node-x").unwrap();
         fs::write(
-            root.join("intel-rapl/intel-rapl:0/energy_uj"),
+            root.join("intel-rapl:0/energy_uj"),
             format!("{}\n", u64::MAX),
         )
         .unwrap();

@@ -7,10 +7,8 @@ so no elevated privileges are needed in the Python process.
 Semantics: the meter snapshots the most recent daemon sample at each marker
 (`start`/`record`/`stop`), so tag boundaries are quantized to the sampling
 interval (`interval_ms`, default 10 ms). Cumulative energy counters become
-wrap-corrected joule deltas; legacy point-in-time `INSTANT` power sources are
-integrated with the trapezoidal rule and reported as estimates. Native
-`INTERVAL_AVERAGE` sources require the offline boundary-aware analysis API,
-which consumes their linked raw duration evidence.
+wrap-corrected joule deltas; instant power sources (watts) are integrated
+with the trapezoidal rule and reported as estimates.
 """
 
 from __future__ import annotations
@@ -26,7 +24,6 @@ from .client import WattchClient
 from .errors import WattchError
 
 _ENERGY_UNIT_TO_JOULES = {"JOULE": 1.0, "MICROJOULE": 1e-6}
-_POWER_UNIT_TO_WATTS = {"WATT": 1.0, "MILLIWATT": 1e-3}
 
 
 def cumulative_delta(start: float, end: float, max_value: float | None) -> float:
@@ -63,15 +60,7 @@ class EnergySample:
 
     @property
     def total_joules(self) -> float:
-        # This remains a convenience value for the pyJoules-compatible API.
-        # Research comparisons must use an explicit MeasurementBoundary so
-        # nested domains cannot be double counted. A meter exposing only
-        # legacy point-in-time instant power reports
-        # its integrated estimates here instead of an otherwise misleading
-        # zero. Interval-average sources use the offline analysis path.
-        if self.energy:
-            return sum(self.energy.values())
-        return sum(self.estimated_energy.values())
+        return sum(self.energy.values())
 
 
 @dataclass(frozen=True)
@@ -181,7 +170,7 @@ class EnergyMeter:
             self._instant_joules = {
                 sid: 0.0
                 for sid, s in self._sources.items()
-                if s.temporality == "INSTANT" and s.unit in _POWER_UNIT_TO_WATTS
+                if s.temporality == "INSTANT" and s.unit == "WATT"
             }
             self._client.start_capture(self._run_id, self.interval_ms, self.source_ids)
         except BaseException:
@@ -311,21 +300,18 @@ class EnergyMeter:
                 self._latest[sample.source_id] = value
                 self._latest_ns = max(self._latest_ns, sample.monotonic_ns)
                 if sample.source_id in self._instant_joules:
-                    watts = value * _POWER_UNIT_TO_WATTS[
-                        self._sources[sample.source_id].unit
-                    ]
                     previous = self._instant_last.get(sample.source_id)
                     if previous is not None:
                         previous_ns, previous_watts = previous
                         self._instant_joules[sample.source_id] += (
-                            (previous_watts + watts)
+                            (previous_watts + value)
                             / 2.0
                             * (sample.monotonic_ns - previous_ns)
                             / 1e9
                         )
                     self._instant_last[sample.source_id] = (
                         sample.monotonic_ns,
-                        watts,
+                        value,
                     )
 
     def _build_trace(self) -> EnergyTrace:

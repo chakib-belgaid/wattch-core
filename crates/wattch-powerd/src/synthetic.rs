@@ -15,7 +15,6 @@ const CORE_ID: u32 = 2;
 const DRAM_ID: u32 = 3;
 const GPU_ID: u32 = 4;
 
-#[derive(Clone)]
 pub struct SyntheticBackend {
     descriptors: Vec<SourceDescriptor>,
     rng_state: u64,
