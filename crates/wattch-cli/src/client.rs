@@ -50,6 +50,7 @@ const MAX_CAPTURE_BATCH_BYTES: usize = 1024 * 1024;
 pub struct WattchClient {
     stream: UnixStream,
     hello: HelloResponse,
+    pending_frame: Vec<u8>,
 }
 
 impl WattchClient {
@@ -71,7 +72,8 @@ impl WattchClient {
             }),
         )?;
 
-        let hello = match read_message_before(&mut stream, CONTROL_TIMEOUT)? {
+        let mut pending_frame = Vec::new();
+        let hello = match read_message_before(&mut stream, CONTROL_TIMEOUT, &mut pending_frame)? {
             Message::HelloResponse(hello) => hello,
             Message::Error(err) => {
                 return Err(ClientError::Daemon {
@@ -109,7 +111,11 @@ impl WattchClient {
             )));
         }
 
-        Ok(Self { stream, hello })
+        Ok(Self {
+            stream,
+            hello,
+            pending_frame,
+        })
     }
 
     pub fn hello(&self) -> &HelloResponse {
@@ -152,7 +158,7 @@ impl WattchClient {
             .iter()
             .map(|source| source.local_source_id)
             .collect();
-        match read_message_before(&mut self.stream, CONTROL_TIMEOUT)? {
+        match read_message_before(&mut self.stream, CONTROL_TIMEOUT, &mut self.pending_frame)? {
             Message::StartCaptureAck(ack) => {
                 if ack.run_id != run_id {
                     return Err(ClientError::Protocol(format!(
@@ -218,12 +224,15 @@ impl WattchClient {
                     "daemon did not acknowledge StopCapture before the deadline".to_string(),
                 ));
             }
-            let message =
-                match read_message_before(&mut self.stream, nonzero_remaining(read_deadline)) {
-                    Ok(message) => message,
-                    Err(err) if wire_timeout(&err) => continue,
-                    Err(err) => return Err(err.into()),
-                };
+            let message = match read_message_before(
+                &mut self.stream,
+                nonzero_remaining(read_deadline),
+                &mut self.pending_frame,
+            ) {
+                Ok(message) => message,
+                Err(err) if wire_timeout(&err) => continue,
+                Err(err) => return Err(err.into()),
+            };
             match message {
                 Message::RawSampleBatch(batch) => {
                     let encoded_len = serde_json::to_vec(&batch)
@@ -321,10 +330,20 @@ fn wire_timeout(error: &WireError) -> bool {
 struct DeadlineReader<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
+    pending: &'a mut Vec<u8>,
+    position: usize,
 }
 
 impl Read for DeadlineReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        // Replaying a partial frame preserves framing when the active capture
+        // deadline expires after consuming only a header or part of a payload.
+        if self.position < self.pending.len() {
+            let count = buffer.len().min(self.pending.len() - self.position);
+            buffer[..count].copy_from_slice(&self.pending[self.position..self.position + count]);
+            self.position += count;
+            return Ok(count);
+        }
         let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -333,13 +352,59 @@ impl Read for DeadlineReader<'_> {
         };
         self.stream
             .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
-        self.stream.read(buffer)
+        let count = self.stream.read(buffer)?;
+        self.pending.extend_from_slice(&buffer[..count]);
+        self.position += count;
+        Ok(count)
     }
 }
 
-fn read_message_before(stream: &mut UnixStream, timeout: Duration) -> Result<Message, WireError> {
+fn read_message_before(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    pending: &mut Vec<u8>,
+) -> Result<Message, WireError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| WireError::Io(io::Error::other("read deadline is too large")))?;
-    read_message(&mut DeadlineReader { stream, deadline })
+    let result = read_message(&mut DeadlineReader {
+        stream,
+        deadline,
+        pending,
+        position: 0,
+    });
+    if result.is_ok() {
+        pending.clear();
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use wattch_protocol::frame::{encode_frame, FrameKind};
+
+    #[test]
+    fn partial_frame_survives_capture_deadline() {
+        for split in [4, 20] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            let frame = encode_frame(
+                FrameKind::StopCaptureAck,
+                0,
+                br#"{"run_id":"run-test","batches_sent":0,"samples_sent":0}"#,
+            )
+            .unwrap();
+            writer.write_all(&frame[..split]).unwrap();
+            let mut pending = Vec::new();
+            let error = read_message_before(&mut reader, Duration::from_millis(10), &mut pending)
+                .unwrap_err();
+            assert!(wire_timeout(&error));
+            writer.write_all(&frame[split..]).unwrap();
+            assert!(matches!(
+                read_message_before(&mut reader, Duration::from_secs(1), &mut pending).unwrap(),
+                Message::StopCaptureAck(_)
+            ));
+        }
+    }
 }
