@@ -14,7 +14,7 @@
 //! any OS with a fake tree. Reads stay raw: cumulative microjoule counters,
 //! no deltas, no aggregation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -75,6 +75,7 @@ fn scan_zones(root: &Path) -> Result<Vec<Zone>, RaplError> {
     }
 
     let mut zones = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = fs::read_dir(&dir).map_err(|source| RaplError::Read {
@@ -101,6 +102,16 @@ fn scan_zones(root: &Path) -> Result<Vec<Zone>, RaplError> {
                 continue;
             };
             if !path.join("energy_uj").exists() {
+                continue;
+            }
+            // /sys/class/powercap links both packages and their children.
+            // A child is also reachable through its package, so compare
+            // canonical directories before recording or descending a zone.
+            let path = fs::canonicalize(&path).map_err(|source| RaplError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            if !seen.insert(path.clone()) {
                 continue;
             }
             let name = read_trimmed(&path.join("name"))?;
@@ -338,6 +349,64 @@ mod tests {
         assert_eq!(psys.kind, SourceKind::Other);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysfs_class_aliases_emit_each_zone_once() {
+        use std::os::unix::fs::symlink;
+
+        let root = fake_tree("class-aliases");
+        let class_root = root.join("class");
+        fs::create_dir(&class_root).unwrap();
+        // Linux exposes each zone in /sys/class/powercap as a symlink,
+        // including children already reachable through the package link.
+        for relative in [
+            "intel-rapl:0",
+            "intel-rapl:0/intel-rapl:0:0",
+            "intel-rapl:0/intel-rapl:0:1",
+            "intel-rapl:1",
+        ] {
+            let zone = root.join(relative);
+            symlink(&zone, class_root.join(zone.file_name().unwrap())).unwrap();
+        }
+
+        let mut backend = RaplBackend::new(&class_root, "node-x").unwrap();
+        assert_eq!(backend.descriptors().len(), 4, "one source per real zone");
+        wattch_core::validate_source_set(backend.descriptors()).unwrap();
+        assert_eq!(backend.sample().len(), 4, "read every counter only once");
+        let core = backend
+            .descriptors()
+            .iter()
+            .find(|d| d.kind == SourceKind::CpuCoreEnergy)
+            .unwrap();
+        assert_eq!(
+            core.parent_source_uid.as_deref(),
+            Some("rapl://node-x/intel-rapl:0")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_msr_and_mmio_zones_are_not_merged() {
+        let root = fake_tree("msr-mmio");
+        write_zone(
+            &root.join("intel-rapl-mmio:0"),
+            "package-0",
+            1_000_000,
+            262_143_328_850,
+        );
+        let mut backend = RaplBackend::new(&root, "node-x").unwrap();
+        assert_eq!(backend.descriptors().len(), 5);
+        wattch_core::validate_source_set(backend.descriptors()).unwrap();
+        assert!(backend
+            .descriptors()
+            .iter()
+            .any(|d| d.source_uid == "rapl://node-x/intel-rapl-mmio:0"));
+        assert_eq!(backend.sample().len(), 5);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

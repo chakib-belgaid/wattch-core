@@ -112,7 +112,7 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
-    "test": "tsc && node --test \"out/test/*.test.js\""
+    "test": "tsc && node --test out/test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
